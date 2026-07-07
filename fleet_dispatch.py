@@ -67,6 +67,21 @@ def _load_allowed_tools() -> list[str]:
     return list(DEFAULT_ALLOWED_TOOLS)
 
 
+def _with_rtk_allowlist(tools: list[str]) -> list[str]:
+    # rtk's hook rewrites `git status` -> `rtk git status` (it prepends `rtk `).
+    # The rewritten command still has to satisfy the worker's --allowedTools or a
+    # headless worker stalls on a denied command -- and the denial auto-widen in
+    # _record_usage can't recover it (it would re-add `Bash(git *)`, not the
+    # `rtk`-prefixed form). Mirror each Bash(X) entry with Bash(rtk X) so the
+    # compact form is allowed exactly where the original was, never broader.
+    mirrored = list(tools)
+    for t in tools:
+        if t.startswith("Bash(") and t.endswith(")"):
+            inner = t[len("Bash(") : -1]
+            mirrored.append(f"Bash(rtk {inner})")
+    return mirrored
+
+
 def _save_allowed_tools(tools: list[str], *, commit_message: str) -> None:
     ALLOWED_TOOLS_PATH.parent.mkdir(parents=True, exist_ok=True)
     ALLOWED_TOOLS_PATH.write_text(json.dumps(tools, indent=2))
@@ -227,7 +242,13 @@ def _record_usage(
 
 
 def _dispatch_one(
-    account: Account, candidate: Candidate, *, execute: bool, max_budget_usd: float, ledger: Ledger
+    account: Account,
+    candidate: Candidate,
+    *,
+    execute: bool,
+    max_budget_usd: float,
+    ledger: Ledger,
+    rtk: bool = False,
 ) -> None:
     repo, _number = candidate.id.split("#")
     repo_path = WORKSPACE_ROOT / repo
@@ -254,6 +275,10 @@ def _dispatch_one(
         branch=branch,
     )
 
+    allowed_tools = _load_allowed_tools()
+    if rtk:
+        allowed_tools = _with_rtk_allowlist(allowed_tools)
+
     with Workspace(repo_path, base_ref="main") as tree:
         subprocess.run(["git", "-C", str(tree), "checkout", "-b", branch], check=True)
         env = {**os.environ, "CLAUDE_CONFIG_DIR": str(account.config_dir)}
@@ -268,7 +293,7 @@ def _dispatch_one(
                 "--max-budget-usd",
                 str(max_budget_usd),
                 "--allowedTools",
-                *_load_allowed_tools(),
+                *allowed_tools,
             ],
             cwd=tree,
             env=env,
@@ -338,9 +363,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--rtk",
         action="store_true",
-        help="require the rtk output-compression hook to be installed in every "
-        "account's config dir before dispatching (compression itself is inherited "
-        "from that hook — this only preflight-verifies it, never installs it)",
+        help="enable rtk output compression: preflight-verify the rtk hook is "
+        "installed in every account's config dir (never installs it — rtk's own "
+        "`rtk init -g` owns that), and mirror each Bash(X) allowlist entry with "
+        "Bash(rtk X) so the hook's rewritten `rtk <cmd>` commands still pass the "
+        "headless worker's --allowedTools",
     )
     parser.add_argument("--org", default="MyThingsLab")
     parser.add_argument(
@@ -389,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
             execute=args.execute,
             max_budget_usd=args.max_budget_usd,
             ledger=dispatch_ledger,
+            rtk=args.rtk,
         )
     for account in accounts[len(dispatchable) :]:
         print(f"\n=== {account.name}: no ready issue candidate ===")
