@@ -11,6 +11,14 @@ Only "issue" candidates are dispatchable today; "scaffold" candidates (a
 not-yet-built tool) need MyScaffolder, which doesn't exist yet, so they're
 reported and skipped.
 
+Attempts never restart from scratch. Every terminal outcome is durable (the
+branch is pushed even on failure, the transcript + a per-issue ledger entry
+persist), so when an issue comes back around a later attempt reads what the
+prior one did, resumes its branch, and moves forward. If an issue is blocked by
+a missing capability in another tool's repo the worker files that as an issue
+there and the issue is paused (not failed) until the blocker closes; after
+MAX_ATTEMPTS unresolved tries it's handed to a human.
+
 Each run ends at "PR opened" — never pushes to main, never merges. Defaults to
 --dry-run; pass --execute to actually spawn the headless sessions.
 """
@@ -71,6 +79,10 @@ DEFAULT_ALLOWED_TOOLS = [
     "Bash(grep*)",
     "Bash(gh issue view*)",
     "Bash(gh pr create*)",
+    # Filing a blocker issue in another tool's repo when this one can't proceed
+    # is a first-class move in the resume/recover loop (see _prompt_for's blocker
+    # protocol), so the worker needs to create issues, not just view them.
+    "Bash(gh issue create*)",
 ]
 
 
@@ -180,10 +192,45 @@ def _preflight_rtk(accounts: list[Account]) -> list[str]:
     return problems
 
 
-def _prompt_for(candidate: Candidate) -> str:
+def _prompt_for(candidate: Candidate, prior: Attempt | None = None) -> str:
     repo, number = candidate.id.split("#")
+
+    resume_block = ""
+    if prior is not None:
+        left_work = prior.outcome in {"needs_review", "failed"}
+        resume_block = (
+            f"THIS IS A RESUMED ATTEMPT (#{prior.attempt_number + 1}). A previous "
+            f"attempt on this issue ended '{prior.outcome}'"
+            + (
+                ", and you are already checked out on the branch it left behind.\n"
+                if left_work
+                else " without leaving committed work.\n"
+            )
+            + (
+                f"Its parting message was: {prior.final_message[:400]!r}\n"
+                if prior.final_message
+                else ""
+            )
+            + "Do NOT start over. First run `git log --oneline main..HEAD` and "
+            "`git diff main...HEAD` to see exactly what the prior attempt already "
+            "did and where it got stuck, then continue from there — fix what broke "
+            "and finish the issue.\n\n"
+        )
+
+    blocker_block = (
+        "If this issue turns out to be blocked by a missing capability in ANOTHER "
+        "MyThingsLab repo (a contract, helper, or fix that repo must land first), "
+        "do not thrash against it. Use `gh issue create --repo MyThingsLab/<repo>` "
+        "to file a precise issue describing exactly what that repo must add and "
+        "why, then END your run by printing one final line, exactly:\n"
+        "  FLEET-DISPATCH-BLOCKED: MyThingsLab/<repo>#<number>\n"
+        "naming the issue you just filed. That records the dependency so this issue "
+        "is paused, not failed, until the blocker is resolved.\n\n"
+    )
+
     return (
-        f"Work issue #{number} in the {repo} repo (`gh issue view {number} --repo "
+        resume_block
+        + f"Work issue #{number} in the {repo} repo (`gh issue view {number} --repo "
         f"MyThingsLab/{repo}` for the full description; title: {candidate.title!r}).\n\n"
         f"You are running fully non-interactively, as a headless `claude -p` "
         f"session: no human is watching and no one can approve a permission "
@@ -191,12 +238,13 @@ def _prompt_for(candidate: Candidate) -> str:
         f"it will never come. Work only with the tools you already have, and prefer "
         f"your Read, Edit, Write, Glob and Grep tools over shelling out to `ls`, "
         f"`cat`, `find` or `grep` to inspect the repo.\n\n"
-        f"Follow this repo's own CLAUDE.md and HARNESS.md exactly. Make the smallest "
-        f"change that closes the issue, with tests. Run the repo's test suite and "
-        f"linter before finishing. Commit your work, then open a pull request with "
-        f"`gh pr create` describing the change — do not push to main and do not "
-        f"merge the PR yourself. Stay inside this repo; do not touch any other repo "
-        f"in the workspace."
+        + blocker_block
+        + "Follow this repo's own CLAUDE.md and HARNESS.md exactly. Make the smallest "
+        "change that closes the issue, with tests. Run the repo's test suite and "
+        "linter before finishing. Commit your work, then open a pull request with "
+        "`gh pr create` describing the change — do not push to main and do not "
+        "merge the PR yourself. Stay inside this repo; do not touch any other repo "
+        "in the workspace."
     )
 
 
@@ -227,6 +275,111 @@ def _open_pr_number(org: str, repo: str, branch: str) -> int | None:
 
 def _branch_name(candidate: Candidate) -> str:
     return f"fleet-dispatch/{candidate.id.replace('#', '-')}"
+
+
+# --- resume / recover loop -------------------------------------------------
+#
+# An attempt on an issue never has to start from scratch. Every terminal
+# dispatch outcome is durable (the branch is pushed even on failure, the
+# transcript + a per-issue ledger entry persist), so a later attempt can read
+# what the prior one did, continue its branch, and move forward -- or, if the
+# issue is blocked by a missing capability in another tool's repo, file that
+# blocker as an issue there and pause this one instead of thrashing.
+
+MAX_ATTEMPTS = 3
+# The worker signals "I filed a blocker issue in another repo; pause this issue
+# rather than count it a failure" by printing a final line of exactly this form.
+# Agent-owned judgment, machine-readable handoff.
+_BLOCKED_SENTINEL = "FLEET-DISPATCH-BLOCKED:"
+_TERMINAL_OUTCOMES = frozenset(
+    {"success", "needs_review", "no_changes", "failed", "blocked", "needs_human"}
+)
+_RESUMABLE_OUTCOMES = frozenset({"needs_review", "no_changes", "failed"})
+
+
+@dataclass(frozen=True)
+class Attempt:
+    candidate_id: str
+    outcome: str
+    branch: str
+    attempt_number: int  # count of terminal attempts so far, this one included
+    final_message: str = ""
+    blocker: str | None = None  # "<org>/<repo>#<n>" when outcome == "blocked"
+
+
+def _parse_blocker(final_message: str) -> str | None:
+    for line in final_message.splitlines():
+        line = line.strip()
+        if line.startswith(_BLOCKED_SENTINEL):
+            ref = line[len(_BLOCKED_SENTINEL) :].strip()
+            return ref or None
+    return None
+
+
+def _last_attempt(ledger: Ledger, candidate_id: str) -> Attempt | None:
+    entries = [
+        e
+        for e in ledger
+        if e.tool == "fleet_dispatch"
+        and e.kind == "dispatch"
+        and e.outcome in _TERMINAL_OUTCOMES
+        and e.data.get("candidate") == candidate_id
+    ]
+    if not entries:
+        return None
+    last = entries[-1]
+    return Attempt(
+        candidate_id=candidate_id,
+        outcome=last.outcome,
+        branch=last.data.get("branch", ""),
+        attempt_number=len(entries),
+        final_message=last.data.get("final_message", ""),
+        blocker=last.data.get("blocker"),
+    )
+
+
+def _dispatch_decision(
+    attempt: Attempt | None, blocker_open: bool, max_attempts: int = MAX_ATTEMPTS
+) -> str:
+    # Pure routing rule: what should happen to an issue given its last attempt?
+    # Returns one of: "fresh", "resume", "skip:done", "skip:blocked",
+    # "skip:needs_human".
+    if attempt is None:
+        return "fresh"
+    if attempt.outcome == "success":
+        return "skip:done"
+    if attempt.outcome == "needs_human":
+        return "skip:needs_human"
+    if attempt.outcome == "blocked":
+        return "skip:blocked" if blocker_open else "resume"
+    # needs_review / no_changes / failed -- resumable until we've tried enough.
+    if attempt.attempt_number >= max_attempts:
+        return "skip:needs_human"
+    return "resume"
+
+
+def _issue_is_open(ref: str) -> bool:
+    # ref is "<org>/<repo>#<number>", e.g. "MyThingsLab/mythings-core#25".
+    if "#" not in ref:
+        return False
+    repo, number = ref.rsplit("#", 1)
+    if not number.isdigit():
+        return False
+    result = subprocess.run(
+        ["gh", "issue", "view", number, "--repo", repo, "--json", "state", "--jq", ".state"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip().upper() == "OPEN"
+
+
+def _remote_branch_exists(repo_path: Path, branch: str) -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "ls-remote", "--exit-code", "--heads", "origin", branch],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def _record_usage(
@@ -315,19 +468,29 @@ def _dispatch_one(
     max_budget_usd: float,
     ledger: Ledger,
     org: str,
+    prior: Attempt | None = None,
     rtk: bool = False,
 ) -> None:
     repo, _number = candidate.id.split("#")
     repo_path = WORKSPACE_ROOT / repo
     branch = _branch_name(candidate)
-    prompt = _prompt_for(candidate)
+    prompt = _prompt_for(candidate, prior)
+    attempt_number = (prior.attempt_number + 1) if prior is not None else 1
 
+    # Resume from the prior attempt's pushed branch when one exists, so the
+    # worker continues that work instead of restarting from main. If the prior
+    # attempt left nothing durable (no_changes never pushed), fall back to main
+    # but still carry its context in the prompt.
+    resuming_branch = prior is not None and _remote_branch_exists(repo_path, branch)
+    base_ref = f"origin/{branch}" if resuming_branch else "main"
+
+    mode = "fresh" if prior is None else f"resume#{attempt_number} from {prior.outcome}"
     # One print call, not several: with dispatches now running concurrently in
     # separate threads, individual print()s from different accounts could
     # otherwise interleave mid-block and produce unreadable output.
     print(
-        f"\n=== {account.name} -> {candidate.id} ({repo}) ===\n"
-        f"  branch: {branch}\n"
+        f"\n=== {account.name} -> {candidate.id} ({repo}) [{mode}] ===\n"
+        f"  branch: {branch} (base {base_ref})\n"
         f"  config: {account.config_dir}\n"
         f"  budget cap: ${max_budget_usd}\n"
         f"  prompt: {prompt}"
@@ -341,22 +504,27 @@ def _dispatch_one(
         tool="fleet_dispatch",
         kind="dispatch",
         outcome="started",
-        detail=f"{account.name} -> {candidate.id}",
+        detail=f"{account.name} -> {candidate.id} ({mode})",
         candidate=candidate.id,
         account=account.name,
         branch=branch,
+        attempt=attempt_number,
     )
 
     allowed_tools = _load_allowed_tools()
     if rtk:
         allowed_tools = _with_rtk_allowlist(allowed_tools)
 
-    with Workspace(repo_path, base_ref="main") as tree:
-        # -B, not -b: a leftover local branch ref from a prior aborted/no-op run
-        # (the temp worktree is gone but its `checkout -b` ref persists in the
-        # shared .git) must not crash a fresh dispatch. Resetting it to this
-        # worktree's detached-main HEAD is safe -- any branch that still has real
-        # work in flight was already filtered out by the open-PR skip in main().
+    if resuming_branch:
+        subprocess.run(
+            ["git", "-C", str(repo_path), "fetch", "origin", branch], check=True
+        )
+
+    with Workspace(repo_path, base_ref=base_ref) as tree:
+        # -B, not -b: reset the local branch ref to this worktree's HEAD (the
+        # prior branch tip when resuming, else main). A leftover local ref from a
+        # prior run's now-removed worktree would otherwise make `checkout -b`
+        # crash; any branch with an open PR was already skipped in main().
         subprocess.run(["git", "-C", str(tree), "checkout", "-B", branch], check=True)
         # Snapshot the branch point now, so "did the worker commit anything?" is
         # measured against where it started -- not the `main` ref, which another
@@ -394,75 +562,70 @@ def _dispatch_one(
             ledger=ledger, rtk=rtk,
         )
 
-        if result.returncode != 0:
-            print(f"  [{account.name}] claude exited {result.returncode}; leaving branch for review")
-            ledger.record(
-                tool="fleet_dispatch",
-                kind="dispatch",
-                outcome="failed",
-                detail=f"{account.name} -> {candidate.id}: claude exited {result.returncode}",
-                candidate=candidate.id,
-                account=account.name,
-                branch=branch,
-            )
-            return
-
-        # A clean exit code is not proof of work. Gate on a real commit before
-        # pushing anything: a worker that gave up (asked for an approval no one
-        # could grant) exits 0 with the branch untouched, and pushing that dead
-        # branch + logging "success" is the false positive this guards against.
-        n_commits = int(
+        # Count the branch's own commits via merge-base (robust to main
+        # advancing under a concurrent dispatch) to judge whether real work
+        # exists on the branch at all; count this run's additions separately so
+        # a resume that made no progress is visible.
+        merge_base = subprocess.run(
+            ["git", "-C", str(tree), "merge-base", "main", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        total_commits = int(
+            subprocess.run(
+                ["git", "-C", str(tree), "rev-list", "--count", f"{merge_base}..HEAD"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            or "0"
+        )
+        new_commits = int(
             subprocess.run(
                 ["git", "-C", str(tree), "rev-list", "--count", f"{base_sha}..HEAD"],
                 capture_output=True, text=True, check=True,
             ).stdout.strip()
             or "0"
         )
-        if n_commits == 0:
-            outcome, msg = _dispatch_outcome(0, None)
-            tail = (
-                f" (worker's last words: {report.final_message[:160]!r})"
-                if report.final_message
-                else ""
-            )
-            print(f"  [{account.name}] {msg}{tail}")
-            ledger.record(
-                tool="fleet_dispatch",
-                kind="dispatch",
-                outcome=outcome,
-                detail=f"{account.name} -> {candidate.id}: {msg}",
-                candidate=candidate.id,
-                account=account.name,
-                branch=branch,
-                final_message=report.final_message[:500],
-                denials_count=len(report.denials),
-            )
-            return
 
-        push = subprocess.run(
-            ["git", "-C", str(tree), "push", "-u", "origin", branch],
-            capture_output=True,
-            text=True,
+        blocker = _parse_blocker(report.final_message)
+
+        # Durability is the whole point of the resume loop: push any real commits
+        # so a later attempt can pick them up, even when this run failed or only
+        # got partway. (No commits -> nothing to push, and no dead branch left.)
+        pushed = False
+        pr_number: int | None = None
+        if total_commits > 0:
+            push = subprocess.run(
+                ["git", "-C", str(tree), "push", "-u", "origin", branch],
+                capture_output=True, text=True,
+            )
+            pushed = push.returncode == 0
+            if not pushed:
+                print(f"  [{account.name}] push failed: {push.stderr.strip()}")
+
+        # An explicit blocker signal wins over everything else: the worker chose
+        # to pause on a cross-repo dependency, which is a distinct outcome from
+        # failing. Then a non-zero exit, then "committed nothing", then the
+        # commit+PR discrimination (success vs needs_review).
+        if blocker is not None:
+            outcome, msg = "blocked", f"paused on cross-repo blocker {blocker}"
+        elif result.returncode != 0:
+            outcome, msg = "failed", f"claude exited {result.returncode}"
+        elif total_commits == 0:
+            outcome, msg = "no_changes", "worker committed nothing"
+        elif not pushed:
+            outcome, msg = "failed", "commits present but push failed"
+        else:
+            pr_number = _open_pr_number(org, repo, branch)
+            outcome, msg = _dispatch_outcome(total_commits, pr_number)
+
+        note = (
+            f" (worker's last words: {report.final_message[:160]!r})"
+            if report.final_message and outcome in {"no_changes", "failed", "blocked"}
+            else ""
         )
-        if push.returncode != 0:
-            print(f"  [{account.name}] push failed: {push.stderr.strip()}")
-            ledger.record(
-                tool="fleet_dispatch",
-                kind="dispatch",
-                outcome="failed",
-                detail=f"{account.name} -> {candidate.id}: push failed: {push.stderr.strip()}",
-                candidate=candidate.id,
-                account=account.name,
-                branch=branch,
-            )
-            return
-
-        # Pushed with real commits -- but the worker owns `gh pr create`, so
-        # confirm a PR actually exists before calling it a success rather than
-        # trusting the prompt was followed.
-        pr_number = _open_pr_number(org, repo, branch)
-        outcome, msg = _dispatch_outcome(n_commits, pr_number)
-        print(f"  [{account.name}] pushed {branch} ({n_commits} commit(s)): {msg}")
+        print(
+            f"  [{account.name}] {mode}: {outcome} — {msg} "
+            f"[{total_commits} commit(s) on branch, +{new_commits} this run]{note}"
+        )
         ledger.record(
             tool="fleet_dispatch",
             kind="dispatch",
@@ -471,8 +634,14 @@ def _dispatch_one(
             candidate=candidate.id,
             account=account.name,
             branch=branch,
-            commits=n_commits,
+            attempt=attempt_number,
+            commits=total_commits,
+            new_commits=new_commits,
+            pushed=pushed,
             pr_number=pr_number,
+            blocker=blocker,
+            final_message=report.final_message[:500],
+            denials_count=len(report.denials),
         )
 
 
@@ -548,7 +717,45 @@ def main(argv: list[str] | None = None) -> int:
         dispatchable = [c for c in dispatchable if c.id not in ids]
 
     dispatch_ledger = Ledger(DISPATCH_LEDGER)
-    pairs = list(zip(accounts, dispatchable))
+
+    # Resume/recover routing: read each issue's last attempt and decide whether
+    # to start fresh, resume the prior branch, or skip it -- still blocked on a
+    # cross-repo dependency, or given up on after MAX_ATTEMPTS tries.
+    plan: list[tuple[Candidate, Attempt | None]] = []
+    for c in dispatchable:
+        prior = _last_attempt(dispatch_ledger, c.id)
+        blocker_open = (
+            _issue_is_open(prior.blocker)
+            if prior is not None and prior.outcome == "blocked" and prior.blocker
+            else False
+        )
+        decision = _dispatch_decision(prior, blocker_open)
+        if decision == "skip:done":
+            continue
+        if decision == "skip:blocked":
+            print(f"skipping (blocked on {prior.blocker}, still open): {c.id}")
+            continue
+        if decision == "skip:needs_human":
+            print(f"skipping (needs a human after {prior.attempt_number} attempts): {c.id}")
+            # Record it once, so it stays skipped instead of being re-evaluated
+            # (and re-counted) every run.
+            if prior.outcome != "needs_human":
+                dispatch_ledger.record(
+                    tool="fleet_dispatch",
+                    kind="dispatch",
+                    outcome="needs_human",
+                    detail=f"{c.id}: gave up after {prior.attempt_number} attempts "
+                    f"(last outcome: {prior.outcome})",
+                    candidate=c.id,
+                    account="-",
+                    branch=_branch_name(c),
+                    attempt=prior.attempt_number,
+                    final_message=prior.final_message[:500],
+                )
+            continue
+        plan.append((c, prior if decision == "resume" else None))
+
+    pairs = list(zip(accounts, plan))
     failures: list[tuple[Account, Candidate, BaseException]] = []
     if pairs:
         # One worker thread per account: each already runs in its own git
@@ -565,9 +772,10 @@ def main(argv: list[str] | None = None) -> int:
                     max_budget_usd=args.max_budget_usd,
                     ledger=dispatch_ledger,
                     org=args.org,
+                    prior=prior,
                     rtk=args.rtk,
                 ): (account, candidate)
-                for account, candidate in pairs
+                for account, (candidate, prior) in pairs
             }
             # future.exception() blocks until that future is done but, unlike
             # future.result(), never raises -- so one account's crash can't
@@ -578,7 +786,7 @@ def main(argv: list[str] | None = None) -> int:
                     failures.append((account, candidate, exc))
     for account, candidate, exc in failures:
         print(f"  [{account.name}] {candidate.id} crashed: {exc!r}")
-    for account in accounts[len(dispatchable) :]:
+    for account in accounts[len(plan) :]:
         print(f"\n=== {account.name}: no ready issue candidate ===")
 
     if not args.execute:

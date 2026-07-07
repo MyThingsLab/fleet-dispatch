@@ -136,7 +136,9 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
     calls: list[tuple[str, float, float]] = []
     calls_lock = threading.Lock()
 
-    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, org, rtk=False):
+    def fake_dispatch_one(
+        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False
+    ):
         start = time.monotonic()
         time.sleep(0.2)
         end = time.monotonic()
@@ -144,6 +146,7 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
             calls.append((account.name, start, end))
 
     monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
 
     candidates = [
         fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
@@ -179,10 +182,13 @@ def test_main_surfaces_every_account_failure_not_just_first(
     # future and unwinds before the loop reaches the second, silently
     # dropping any other account's crash. Both accounts fail here on purpose;
     # both should still be reported.
-    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, org, rtk=False):
+    def fake_dispatch_one(
+        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False
+    ):
         raise RuntimeError(f"boom-{account.name}")
 
     monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
 
     candidates = [
         fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
@@ -216,10 +222,13 @@ def test_main_skips_issue_with_open_pr_in_flight(tmp_path: Path, monkeypatch) ->
     # an account again -- otherwise a second, duplicate PR gets opened for it.
     dispatched: list[str] = []
 
-    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, org, rtk=False):
+    def fake_dispatch_one(
+        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False
+    ):
         dispatched.append(candidate.id)
 
     monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
 
     candidates = [
         fd.Candidate(id="repo#1", repo="repo", tool="", title="done", kind="issue", created_at="2020-01-01"),
@@ -352,3 +361,115 @@ def test_save_allowed_tools_commit_ignores_unrelated_staged_changes(
         capture_output=True, text=True, check=True,
     ).stdout.split()
     assert "unrelated.py" in still_staged
+
+
+# --- resume / recover loop -------------------------------------------------
+
+
+def test_parse_blocker_extracts_ref_else_none() -> None:
+    assert fd._parse_blocker("done\nFLEET-DISPATCH-BLOCKED: MyThingsLab/core#9") == "MyThingsLab/core#9"
+    assert fd._parse_blocker("  FLEET-DISPATCH-BLOCKED: org/repo#12  ") == "org/repo#12"
+    assert fd._parse_blocker("no marker here") is None
+    assert fd._parse_blocker("FLEET-DISPATCH-BLOCKED:") is None
+
+
+def test_default_allowed_tools_can_create_issues_for_blockers() -> None:
+    # Filing a cross-repo blocker issue is part of the loop -> gh issue create.
+    assert "Bash(gh issue create*)" in fd.DEFAULT_ALLOWED_TOOLS
+
+
+@pytest.mark.parametrize(
+    ("attempt", "blocker_open", "expected"),
+    [
+        (None, False, "fresh"),
+        (fd.Attempt("i#1", "success", "b", 1), False, "skip:done"),
+        (fd.Attempt("i#1", "needs_human", "b", 3), False, "skip:needs_human"),
+        (fd.Attempt("i#1", "blocked", "b", 1, blocker="o/r#2"), True, "skip:blocked"),
+        (fd.Attempt("i#1", "blocked", "b", 1, blocker="o/r#2"), False, "resume"),
+        (fd.Attempt("i#1", "needs_review", "b", 1), False, "resume"),
+        (fd.Attempt("i#1", "no_changes", "b", 2), False, "resume"),
+        (fd.Attempt("i#1", "failed", "b", 3), False, "skip:needs_human"),  # hit the cap
+    ],
+)
+def test_dispatch_decision(attempt, blocker_open: bool, expected: str) -> None:
+    assert fd._dispatch_decision(attempt, blocker_open, max_attempts=3) == expected
+
+
+def test_last_attempt_reads_latest_terminal_and_counts_attempts(tmp_path: Path) -> None:
+    led = Ledger(tmp_path / "l.jsonl")
+    led.record("fleet_dispatch", "dispatch", "started", candidate="r#1", branch="b")
+    led.record("fleet_dispatch", "dispatch", "no_changes", candidate="r#1", branch="b",
+               final_message="stuck on ls")
+    led.record("fleet_dispatch", "dispatch", "started", candidate="r#1", branch="b")
+    led.record("fleet_dispatch", "dispatch", "needs_review", candidate="r#1", branch="b", commits=1)
+    led.record("fleet_dispatch", "dispatch", "success", candidate="other#2", branch="b2")
+
+    a = fd._last_attempt(led, "r#1")
+    assert a is not None
+    assert a.outcome == "needs_review"
+    assert a.attempt_number == 2  # two terminal entries; "started" doesn't count
+    assert a.branch == "b"
+    assert fd._last_attempt(led, "nope#9") is None
+
+
+def test_resume_prompt_carries_prior_context_and_blocker_protocol() -> None:
+    candidate = fd.Candidate(id="r#1", repo="r", tool="", title="t", kind="issue", created_at="")
+    prior = fd.Attempt("r#1", "needs_review", "b", 1, final_message="got halfway")
+    prompt = fd._prompt_for(candidate, prior)
+    assert "RESUMED ATTEMPT" in prompt
+    assert "Do NOT start over" in prompt
+    assert "got halfway" in prompt
+    # Blocker protocol present on every prompt (fresh too).
+    assert "FLEET-DISPATCH-BLOCKED:" in fd._prompt_for(candidate)
+
+
+def test_main_resumes_or_skips_by_prior_attempt(tmp_path: Path, monkeypatch) -> None:
+    got: dict[str, object] = {}
+
+    def fake_dispatch_one(
+        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False
+    ):
+        got[candidate.id] = prior
+
+    monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+
+    candidates = [
+        fd.Candidate(id="r#1", repo="r", tool="", title="resume", kind="issue", created_at="2020-01-01"),
+        fd.Candidate(id="r#2", repo="r", tool="", title="blocked", kind="issue", created_at="2020-01-02"),
+        fd.Candidate(id="r#3", repo="r", tool="", title="capped", kind="issue", created_at="2020-01-03"),
+        fd.Candidate(id="r#4", repo="r", tool="", title="fresh", kind="issue", created_at="2020-01-04"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+
+    attempts = {
+        "r#1": fd.Attempt("r#1", "needs_review", "b1", 1),
+        "r#2": fd.Attempt("r#2", "blocked", "b2", 1, blocker="MyThingsLab/core#9"),
+        "r#3": fd.Attempt("r#3", "failed", "b3", 3),  # at the attempt cap
+    }
+    monkeypatch.setattr(fd, "_last_attempt", lambda ledger, cid: attempts.get(cid))
+    monkeypatch.setattr(fd, "_issue_is_open", lambda ref: True)  # r#2's blocker still open
+
+    rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
+
+    assert rc == 0
+    # r#2 (blocked, still open) and r#3 (hit cap) skipped; r#1 resumed, r#4 fresh.
+    assert set(got) == {"r#1", "r#4"}
+    assert got["r#1"] is attempts["r#1"]  # resumed with its prior attempt
+    assert got["r#4"] is None  # fresh
+    # r#3 hitting the cap is recorded as needs_human so it stays skipped.
+    outcomes = [e.outcome for e in Ledger(tmp_path / "ledger.jsonl") if e.data.get("candidate") == "r#3"]
+    assert "needs_human" in outcomes
