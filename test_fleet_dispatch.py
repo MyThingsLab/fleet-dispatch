@@ -159,3 +159,41 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
     assert len(calls) == 2
     (_name1, start1, end1), (_name2, start2, end2) = calls
     assert start1 < end2 and start2 < end1
+
+
+def test_main_surfaces_every_account_failure_not_just_first(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # Regression test: future.result() in a loop raises on the first failing
+    # future and unwinds before the loop reaches the second, silently
+    # dropping any other account's crash. Both accounts fail here on purpose;
+    # both should still be reported.
+    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, rtk=False):
+        raise RuntimeError(f"boom-{account.name}")
+
+    monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+
+    candidates = [
+        fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
+        fd.Candidate(id="repo#2", repo="repo", tool="", title="t2", kind="issue", created_at="2020-01-02"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+
+    rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "boom-account1" in out
+    assert "boom-account2" in out

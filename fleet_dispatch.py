@@ -430,15 +430,14 @@ def main(argv: list[str] | None = None) -> int:
 
     dispatch_ledger = Ledger(DISPATCH_LEDGER)
     pairs = list(zip(accounts, dispatchable))
+    failures: list[tuple[Account, Candidate, BaseException]] = []
     if pairs:
         # One worker thread per account: each already runs in its own git
         # worktree under its own CLAUDE_CONFIG_DIR (mythings.isolation.Workspace),
         # so nothing about running them at the same time needs new isolation --
-        # only the shared allowlist self-edit does (see _ALLOWLIST_LOCK). The
-        # `with` block still waits for every dispatch to finish even if one
-        # raises, so a failing account can't cut the others short.
+        # only the shared allowlist self-edit does (see _ALLOWLIST_LOCK).
         with ThreadPoolExecutor(max_workers=len(pairs)) as pool:
-            futures = [
+            futures = {
                 pool.submit(
                     _dispatch_one,
                     account,
@@ -447,17 +446,24 @@ def main(argv: list[str] | None = None) -> int:
                     max_budget_usd=args.max_budget_usd,
                     ledger=dispatch_ledger,
                     rtk=args.rtk,
-                )
+                ): (account, candidate)
                 for account, candidate in pairs
-            ]
-            for future in futures:
-                future.result()
+            }
+            # future.exception() blocks until that future is done but, unlike
+            # future.result(), never raises -- so one account's crash can't
+            # stop us from also collecting every other account's outcome.
+            for future, (account, candidate) in futures.items():
+                exc = future.exception()
+                if exc is not None:
+                    failures.append((account, candidate, exc))
+    for account, candidate, exc in failures:
+        print(f"  [{account.name}] {candidate.id} crashed: {exc!r}")
     for account in accounts[len(dispatchable) :]:
         print(f"\n=== {account.name}: no ready issue candidate ===")
 
     if not args.execute:
         print("\n(dry run — pass --execute to actually launch these sessions)")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
