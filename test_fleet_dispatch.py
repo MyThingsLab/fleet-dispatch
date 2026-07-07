@@ -423,6 +423,67 @@ def test_resume_prompt_carries_prior_context_and_blocker_protocol() -> None:
     assert "FLEET-DISPATCH-BLOCKED:" in fd._prompt_for(candidate)
 
 
+def test_resume_prompt_wording_matches_whether_a_branch_exists() -> None:
+    candidate = fd.Candidate(id="r#1", repo="r", tool="", title="t", kind="issue", created_at="")
+    prior = fd.Attempt("r#1", "failed", "b", 1)
+    with_branch = fd._prompt_for(candidate, prior, has_branch=True)
+    without_branch = fd._prompt_for(candidate, prior, has_branch=False)
+    assert "branch it left behind" in with_branch
+    # A failed run that left no commits (e.g. a session limit) must not promise a
+    # branch that isn't there.
+    assert "branch it left behind" not in without_branch
+    assert "starting from main" in without_branch
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("You've hit your session limit · resets 6pm", True),
+        ("Error: usage limit reached", True),
+        ("overloaded_error: server busy", True),
+        ("Traceback: AssertionError in test_foo", False),
+        ("could not find the file", False),
+    ],
+)
+def test_is_transient_failure(message: str, expected: bool) -> None:
+    assert fd._is_transient_failure(message) is expected
+
+
+def test_transient_failures_do_not_count_toward_attempt_cap(tmp_path: Path) -> None:
+    led = Ledger(tmp_path / "l.jsonl")
+    # Two transient (deferred) runs and one real failure.
+    led.record("fleet_dispatch", "dispatch", "deferred", candidate="r#1", branch="b")
+    led.record("fleet_dispatch", "dispatch", "failed", candidate="r#1", branch="b")
+    led.record("fleet_dispatch", "dispatch", "deferred", candidate="r#1", branch="b")
+
+    a = fd._last_attempt(led, "r#1")
+    assert a is not None
+    assert a.outcome == "deferred"  # latest
+    assert a.attempt_number == 1  # only the real "failed" counts, not the two deferred
+
+
+def test_failed_entry_with_transient_message_does_not_count(tmp_path: Path) -> None:
+    # Defends against "failed" entries recorded before transient classification
+    # existed (exactly the two rate-limited #17 runs in the live ledger): a
+    # failure whose message is transient must not count toward the cap.
+    led = Ledger(tmp_path / "l.jsonl")
+    led.record("fleet_dispatch", "dispatch", "failed", candidate="r#1", branch="b",
+               final_message="You've hit your session limit · resets 6pm")
+    led.record("fleet_dispatch", "dispatch", "failed", candidate="r#1", branch="b",
+               final_message="You've hit your session limit · resets 6pm")
+
+    a = fd._last_attempt(led, "r#1")
+    assert a is not None
+    assert a.attempt_number == 0  # both transient -> neither counts
+
+
+def test_dispatch_decision_deferred_always_resumes() -> None:
+    # Even a long string of transient deferrals never escalates to a human,
+    # because attempt_number excludes them (here it's 0).
+    deferred = fd.Attempt("r#1", "deferred", "b", 0)
+    assert fd._dispatch_decision(deferred, blocker_open=False, max_attempts=3) == "resume"
+
+
 def test_main_resumes_or_skips_by_prior_attempt(tmp_path: Path, monkeypatch) -> None:
     got: dict[str, object] = {}
 

@@ -192,19 +192,24 @@ def _preflight_rtk(accounts: list[Account]) -> list[str]:
     return problems
 
 
-def _prompt_for(candidate: Candidate, prior: Attempt | None = None) -> str:
+def _prompt_for(
+    candidate: Candidate, prior: Attempt | None = None, *, has_branch: bool = False
+) -> str:
     repo, number = candidate.id.split("#")
 
     resume_block = ""
     if prior is not None:
-        left_work = prior.outcome in {"needs_review", "failed"}
+        # Whether the prior attempt left committed work is decided by an actual
+        # pushed branch, not by its outcome name -- a "failed" run that stalled
+        # before its first commit (e.g. a session/rate limit) leaves nothing, so
+        # promising a branch that isn't there would just confuse the worker.
         resume_block = (
             f"THIS IS A RESUMED ATTEMPT (#{prior.attempt_number + 1}). A previous "
             f"attempt on this issue ended '{prior.outcome}'"
             + (
                 ", and you are already checked out on the branch it left behind.\n"
-                if left_work
-                else " without leaving committed work.\n"
+                if has_branch
+                else " without leaving any committed work; you are starting from main.\n"
             )
             + (
                 f"Its parting message was: {prior.final_message[:400]!r}\n"
@@ -292,9 +297,30 @@ MAX_ATTEMPTS = 3
 # Agent-owned judgment, machine-readable handoff.
 _BLOCKED_SENTINEL = "FLEET-DISPATCH-BLOCKED:"
 _TERMINAL_OUTCOMES = frozenset(
-    {"success", "needs_review", "no_changes", "failed", "blocked", "needs_human"}
+    {"success", "needs_review", "no_changes", "failed", "blocked", "needs_human", "deferred"}
 )
-_RESUMABLE_OUTCOMES = frozenset({"needs_review", "no_changes", "failed"})
+_RESUMABLE_OUTCOMES = frozenset({"needs_review", "no_changes", "failed", "deferred"})
+# Outcomes that count toward MAX_ATTEMPTS. "deferred" (a transient
+# infrastructure failure -- session/rate limit, network) is excluded: the issue
+# is fine, the fleet just couldn't run right then, so retrying it must not burn
+# the budget that escalates a genuinely-stuck issue to a human.
+_COUNTED_OUTCOMES = _TERMINAL_OUTCOMES - {"deferred"}
+# Substrings that mark a failure as transient/infrastructure rather than a real
+# problem with the issue. Matched case-insensitively against the worker's final
+# message. Kept deliberately narrow -- only unambiguous capacity/transport
+# signals, so a real error is never silently retried forever as "deferred".
+_TRANSIENT_MARKERS = (
+    "session limit",
+    "usage limit",
+    "rate limit",
+    "overloaded",
+    "service unavailable",
+)
+
+
+def _is_transient_failure(final_message: str) -> bool:
+    low = final_message.lower()
+    return any(marker in low for marker in _TRANSIENT_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -328,11 +354,25 @@ def _last_attempt(ledger: Ledger, candidate_id: str) -> Attempt | None:
     if not entries:
         return None
     last = entries[-1]
+    # attempt_number is the count that gates the human-escalation cap, so it
+    # excludes transient runs -- a string of rate limits mustn't push a healthy
+    # issue to needs_human. That means "deferred" outcomes and, defensively, any
+    # "failed" entry whose message reads as transient (e.g. ones recorded before
+    # transient classification existed, or by an older build).
+    counted = sum(
+        1
+        for e in entries
+        if e.outcome in _COUNTED_OUTCOMES
+        and not (
+            e.outcome == "failed"
+            and _is_transient_failure(e.data.get("final_message", ""))
+        )
+    )
     return Attempt(
         candidate_id=candidate_id,
         outcome=last.outcome,
         branch=last.data.get("branch", ""),
-        attempt_number=len(entries),
+        attempt_number=counted,
         final_message=last.data.get("final_message", ""),
         blocker=last.data.get("blocker"),
     )
@@ -352,7 +392,9 @@ def _dispatch_decision(
         return "skip:needs_human"
     if attempt.outcome == "blocked":
         return "skip:blocked" if blocker_open else "resume"
-    # needs_review / no_changes / failed -- resumable until we've tried enough.
+    # needs_review / no_changes / failed / deferred -- resumable. The cap uses
+    # attempt_number, which already excludes deferred (transient) runs, so those
+    # resume indefinitely without ever escalating a healthy issue to a human.
     if attempt.attempt_number >= max_attempts:
         return "skip:needs_human"
     return "resume"
@@ -474,15 +516,15 @@ def _dispatch_one(
     repo, _number = candidate.id.split("#")
     repo_path = WORKSPACE_ROOT / repo
     branch = _branch_name(candidate)
-    prompt = _prompt_for(candidate, prior)
     attempt_number = (prior.attempt_number + 1) if prior is not None else 1
 
     # Resume from the prior attempt's pushed branch when one exists, so the
     # worker continues that work instead of restarting from main. If the prior
-    # attempt left nothing durable (no_changes never pushed), fall back to main
-    # but still carry its context in the prompt.
+    # attempt left nothing durable (no_changes/transient failure never pushed),
+    # fall back to main but still carry its context in the prompt.
     resuming_branch = prior is not None and _remote_branch_exists(repo_path, branch)
     base_ref = f"origin/{branch}" if resuming_branch else "main"
+    prompt = _prompt_for(candidate, prior, has_branch=resuming_branch)
 
     mode = "fresh" if prior is None else f"resume#{attempt_number} from {prior.outcome}"
     # One print call, not several: with dispatches now running concurrently in
@@ -607,6 +649,10 @@ def _dispatch_one(
         # commit+PR discrimination (success vs needs_review).
         if blocker is not None:
             outcome, msg = "blocked", f"paused on cross-repo blocker {blocker}"
+        elif result.returncode != 0 and _is_transient_failure(report.final_message):
+            # Not the issue's fault -- a session/rate limit or transport blip. Keep
+            # it resumable but don't count it toward the human-escalation cap.
+            outcome, msg = "deferred", f"deferred (transient): claude exited {result.returncode}"
         elif result.returncode != 0:
             outcome, msg = "failed", f"claude exited {result.returncode}"
         elif total_commits == 0:
@@ -619,7 +665,7 @@ def _dispatch_one(
 
         note = (
             f" (worker's last words: {report.final_message[:160]!r})"
-            if report.final_message and outcome in {"no_changes", "failed", "blocked"}
+            if report.final_message and outcome in {"no_changes", "failed", "blocked", "deferred"}
             else ""
         )
         print(
