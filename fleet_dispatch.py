@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -96,6 +97,42 @@ def _parse_accounts(raw: str) -> list[Account]:
             continue
         accounts.append(Account(name=f"account{i + 1}", config_dir=Path(entry).expanduser()))
     return accounts
+
+
+def _config_dir_has_rtk_hook(config_dir: Path) -> bool:
+    # rtk installs itself with `rtk init -g` into a CLAUDE_CONFIG_DIR: it writes
+    # a PreToolUse hook to settings.json that rewrites commands to their compact
+    # `rtk` equivalents. We never write that hook ourselves — rtk owns it, and
+    # its schema is versioned — we only read settings.json to confirm a worker
+    # spawned under this dir will actually inherit the compression. The hook is
+    # self-guarding (exits 0 if rtk/jq is missing), so this check is about
+    # "compression is wired", not safety.
+    settings = config_dir / "settings.json"
+    if not settings.is_file():
+        return False
+    try:
+        data = json.loads(settings.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    hooks = data.get("hooks", {}).get("PreToolUse", [])
+    return "rtk" in json.dumps(hooks)
+
+
+def _preflight_rtk(accounts: list[Account]) -> list[str]:
+    # Read-only. Returns human-readable problems; an empty list means rtk
+    # compression is correctly wired for every account. Refusing to --execute
+    # on a non-empty result is the point: a paid run must never silently skip
+    # the compression you asked for.
+    problems = []
+    if shutil.which("rtk") is None:
+        problems.append("`rtk` is not on PATH — install it and run `rtk init -g --hook-only`")
+    for account in accounts:
+        if not _config_dir_has_rtk_hook(account.config_dir):
+            problems.append(
+                f"{account.name} ({account.config_dir}) has no rtk PreToolUse hook — "
+                f"run `CLAUDE_CONFIG_DIR={account.config_dir} rtk init -g --hook-only`"
+            )
+    return problems
 
 
 def _prompt_for(candidate: Candidate) -> str:
@@ -298,6 +335,13 @@ def main(argv: list[str] | None = None) -> int:
         "(each must already be `claude auth login`'d)",
     )
     parser.add_argument("--execute", action="store_true", help="actually launch headless sessions")
+    parser.add_argument(
+        "--rtk",
+        action="store_true",
+        help="require the rtk output-compression hook to be installed in every "
+        "account's config dir before dispatching (compression itself is inherited "
+        "from that hook — this only preflight-verifies it, never installs it)",
+    )
     parser.add_argument("--org", default="MyThingsLab")
     parser.add_argument(
         "--max-budget-usd",
@@ -310,6 +354,15 @@ def main(argv: list[str] | None = None) -> int:
     accounts = _parse_accounts(args.accounts)
     if not accounts:
         parser.error("--accounts must list at least one CLAUDE_CONFIG_DIR")
+
+    if args.rtk:
+        problems = _preflight_rtk(accounts)
+        if problems:
+            print("rtk compression requested (--rtk) but not wired:")
+            for p in problems:
+                print(f"  - {p}")
+            return 1
+        print("rtk output-compression hook verified for every account")
 
     orch = Orchestrator(
         org=args.org,
