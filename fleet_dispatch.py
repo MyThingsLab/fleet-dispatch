@@ -110,12 +110,21 @@ def _save_allowed_tools(tools: list[str], *, commit_message: str) -> None:
     # replaces the pre-git backup-copy approach, and `git revert` is the way
     # back out if a widened pattern turns out to be wrong. The ledger entry
     # that explains *why* rides along in the same commit.
+    #
+    # Commit with an explicit pathspec, NOT a bare `git commit`: WORKSPACE_ROOT
+    # is a live checkout that may have unrelated staged changes, and a bare
+    # commit would sweep them into this self-edit. The pathspec form commits a
+    # snapshot of exactly these two files and leaves anything else staged alone.
     subprocess.run(
         ["git", "-C", str(WORKSPACE_ROOT), "add", str(ALLOWED_TOOLS_PATH), str(DISPATCH_LEDGER)],
         check=True,
     )
     subprocess.run(
-        ["git", "-C", str(WORKSPACE_ROOT), "commit", "-m", commit_message], check=True
+        [
+            "git", "-C", str(WORKSPACE_ROOT), "commit", "-m", commit_message,
+            "--", str(ALLOWED_TOOLS_PATH), str(DISPATCH_LEDGER),
+        ],
+        check=True,
     )
 
 

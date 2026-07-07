@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -10,6 +11,15 @@ from mythings.ledger import Ledger
 
 import fleet_dispatch as fd
 from fleet_usage import UsageReport, family_for
+
+
+def _init_git_repo(path: Path) -> None:
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "t"], check=True)
+    (path / "seed").write_text("seed")
+    subprocess.run(["git", "-C", str(path), "add", "seed"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", "seed"], check=True)
 
 
 def _account(config_dir: Path, settings: dict | None) -> fd.Account:
@@ -309,3 +319,36 @@ def test_prompt_is_noninteractive_and_prefers_native_tools() -> None:
     assert "non-interactively" in prompt
     assert "will never come" in prompt
     assert "Read" in prompt
+
+
+def test_save_allowed_tools_commit_ignores_unrelated_staged_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The self-edit commit runs in a live checkout that may have other staged
+    # changes; it must commit ONLY allowed_tools.json + ledger, never sweep an
+    # unrelated staged file into the auto-widen commit.
+    _init_git_repo(tmp_path)
+    monkeypatch.setattr(fd, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(fd, "ALLOWED_TOOLS_PATH", tmp_path / ".fleet-dispatch" / "allowed_tools.json")
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / ".fleet-dispatch" / "ledger.jsonl")
+    fd.DISPATCH_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    fd.DISPATCH_LEDGER.write_text("{}\n")
+
+    unrelated = tmp_path / "unrelated.py"
+    unrelated.write_text("x = 1\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "unrelated.py"], check=True)
+
+    fd._save_allowed_tools(["Read", "Bash(ls*)"], commit_message="widen")
+
+    committed = subprocess.run(
+        ["git", "-C", str(tmp_path), "show", "--name-only", "--format=", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    assert ".fleet-dispatch/allowed_tools.json" in committed
+    assert "unrelated.py" not in committed
+    # The unrelated file stays staged, uncommitted -- untouched by the self-edit.
+    still_staged = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--cached", "--name-only"],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    assert "unrelated.py" in still_staged
