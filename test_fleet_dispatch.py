@@ -84,6 +84,47 @@ def test_preflight_clean_when_all_wired(tmp_path: Path, monkeypatch) -> None:
     assert fd._preflight_rtk([account]) == []
 
 
+def _account_with_uuid(config_dir: Path, uuid: str | None) -> fd.Account:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    if uuid is not None:
+        (config_dir / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"accountUuid": uuid, "emailAddress": "x@y"}})
+        )
+    return fd.Account(name=config_dir.name, config_dir=config_dir)
+
+
+def test_account_uuid_reads_or_none(tmp_path: Path) -> None:
+    a = _account_with_uuid(tmp_path / "a", "uuid-123")
+    assert fd._account_uuid(a.config_dir) == "uuid-123"
+    assert fd._account_uuid(tmp_path / "missing") is None
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / ".claude.json").write_text("{not json")
+    assert fd._account_uuid(tmp_path / "bad") is None
+
+
+def test_preflight_distinct_accounts_flags_same_account(tmp_path: Path) -> None:
+    # The exact footgun: two config dirs logged into the same account.
+    a = _account_with_uuid(tmp_path / "a", "same-uuid")
+    b = _account_with_uuid(tmp_path / "b", "same-uuid")
+    problems = fd._preflight_distinct_accounts([a, b])
+    assert len(problems) == 1
+    assert "SAME Claude account" in problems[0]
+
+
+def test_preflight_distinct_accounts_clean_when_different(tmp_path: Path) -> None:
+    a = _account_with_uuid(tmp_path / "a", "uuid-a")
+    b = _account_with_uuid(tmp_path / "b", "uuid-b")
+    assert fd._preflight_distinct_accounts([a, b]) == []
+
+
+def test_preflight_distinct_accounts_flags_unreadable_identity(tmp_path: Path) -> None:
+    a = _account_with_uuid(tmp_path / "a", "uuid-a")
+    b = _account_with_uuid(tmp_path / "b", None)  # no .claude.json
+    problems = fd._preflight_distinct_accounts([a, b])
+    assert len(problems) == 1
+    assert "can't read an account identity" in problems[0]
+
+
 def test_with_rtk_allowlist_mirrors_bash_entries_only() -> None:
     tools = ["Read", "Edit", "Bash(git *)", "Bash(pytest*)"]
 
@@ -136,7 +177,9 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
     calls: list[tuple[str, float, float]] = []
     calls_lock = threading.Lock()
 
-    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, org, rtk=False):
+    def fake_dispatch_one(
+        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+    ):
         start = time.monotonic()
         time.sleep(0.2)
         end = time.monotonic()
@@ -144,6 +187,7 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
             calls.append((account.name, start, end))
 
     monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
 
     candidates = [
         fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
@@ -162,6 +206,7 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
             return [FakeRecommendation(c) for c in candidates]
 
     monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
     monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
 
     rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
@@ -179,10 +224,13 @@ def test_main_surfaces_every_account_failure_not_just_first(
     # future and unwinds before the loop reaches the second, silently
     # dropping any other account's crash. Both accounts fail here on purpose;
     # both should still be reported.
-    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, org, rtk=False):
+    def fake_dispatch_one(
+        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+    ):
         raise RuntimeError(f"boom-{account.name}")
 
     monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
 
     candidates = [
         fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
@@ -201,6 +249,7 @@ def test_main_surfaces_every_account_failure_not_just_first(
             return [FakeRecommendation(c) for c in candidates]
 
     monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
     monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
 
     rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
@@ -216,10 +265,13 @@ def test_main_skips_issue_with_open_pr_in_flight(tmp_path: Path, monkeypatch) ->
     # an account again -- otherwise a second, duplicate PR gets opened for it.
     dispatched: list[str] = []
 
-    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, org, rtk=False):
+    def fake_dispatch_one(
+        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+    ):
         dispatched.append(candidate.id)
 
     monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
 
     candidates = [
         fd.Candidate(id="repo#1", repo="repo", tool="", title="done", kind="issue", created_at="2020-01-01"),
@@ -238,6 +290,7 @@ def test_main_skips_issue_with_open_pr_in_flight(tmp_path: Path, monkeypatch) ->
             return [FakeRecommendation(c) for c in candidates]
 
     monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
     # repo#1's branch already has an open PR (#99); repo#2's does not.
     monkeypatch.setattr(
         fd,
@@ -352,3 +405,293 @@ def test_save_allowed_tools_commit_ignores_unrelated_staged_changes(
         capture_output=True, text=True, check=True,
     ).stdout.split()
     assert "unrelated.py" in still_staged
+
+
+# --- resume / recover loop -------------------------------------------------
+
+
+def test_parse_blocker_extracts_ref_else_none() -> None:
+    assert fd._parse_blocker("done\nFLEET-DISPATCH-BLOCKED: MyThingsLab/core#9") == "MyThingsLab/core#9"
+    assert fd._parse_blocker("  FLEET-DISPATCH-BLOCKED: org/repo#12  ") == "org/repo#12"
+    assert fd._parse_blocker("no marker here") is None
+    assert fd._parse_blocker("FLEET-DISPATCH-BLOCKED:") is None
+
+
+def test_default_allowed_tools_can_create_issues_for_blockers() -> None:
+    # Filing a cross-repo blocker issue is part of the loop -> gh issue create.
+    assert "Bash(gh issue create*)" in fd.DEFAULT_ALLOWED_TOOLS
+
+
+@pytest.mark.parametrize(
+    ("attempt", "blocker_open", "expected"),
+    [
+        (None, False, "fresh"),
+        (fd.Attempt("i#1", "success", "b", 1), False, "skip:done"),
+        (fd.Attempt("i#1", "needs_human", "b", 3), False, "skip:needs_human"),
+        (fd.Attempt("i#1", "blocked", "b", 1, blocker="o/r#2"), True, "skip:blocked"),
+        (fd.Attempt("i#1", "blocked", "b", 1, blocker="o/r#2"), False, "resume"),
+        (fd.Attempt("i#1", "needs_review", "b", 1), False, "resume"),
+        (fd.Attempt("i#1", "no_changes", "b", 2), False, "resume"),
+        (fd.Attempt("i#1", "failed", "b", 3), False, "skip:needs_human"),  # hit the cap
+    ],
+)
+def test_dispatch_decision(attempt, blocker_open: bool, expected: str) -> None:
+    assert fd._dispatch_decision(attempt, blocker_open, max_attempts=3) == expected
+
+
+def test_last_attempt_reads_latest_terminal_and_counts_attempts(tmp_path: Path) -> None:
+    led = Ledger(tmp_path / "l.jsonl")
+    led.record("fleet_dispatch", "dispatch", "started", candidate="r#1", branch="b")
+    led.record("fleet_dispatch", "dispatch", "no_changes", candidate="r#1", branch="b",
+               final_message="stuck on ls")
+    led.record("fleet_dispatch", "dispatch", "started", candidate="r#1", branch="b")
+    led.record("fleet_dispatch", "dispatch", "needs_review", candidate="r#1", branch="b", commits=1)
+    led.record("fleet_dispatch", "dispatch", "success", candidate="other#2", branch="b2")
+
+    a = fd._last_attempt(led, "r#1")
+    assert a is not None
+    assert a.outcome == "needs_review"
+    assert a.attempt_number == 2  # two terminal entries; "started" doesn't count
+    assert a.branch == "b"
+    assert fd._last_attempt(led, "nope#9") is None
+
+
+def test_resume_prompt_carries_prior_context_and_blocker_protocol() -> None:
+    candidate = fd.Candidate(id="r#1", repo="r", tool="", title="t", kind="issue", created_at="")
+    prior = fd.Attempt("r#1", "needs_review", "b", 1, final_message="got halfway")
+    prompt = fd._prompt_for(candidate, prior)
+    assert "RESUMED ATTEMPT" in prompt
+    assert "Do NOT start over" in prompt
+    assert "got halfway" in prompt
+    # Blocker protocol present on every prompt (fresh too).
+    assert "FLEET-DISPATCH-BLOCKED:" in fd._prompt_for(candidate)
+
+
+def test_resume_prompt_wording_matches_whether_a_branch_exists() -> None:
+    candidate = fd.Candidate(id="r#1", repo="r", tool="", title="t", kind="issue", created_at="")
+    prior = fd.Attempt("r#1", "failed", "b", 1)
+    with_branch = fd._prompt_for(candidate, prior, has_branch=True)
+    without_branch = fd._prompt_for(candidate, prior, has_branch=False)
+    assert "branch it left behind" in with_branch
+    # A failed run that left no commits (e.g. a session limit) must not promise a
+    # branch that isn't there.
+    assert "branch it left behind" not in without_branch
+    assert "starting from main" in without_branch
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("You've hit your session limit · resets 6pm", True),
+        ("Error: usage limit reached", True),
+        ("overloaded_error: server busy", True),
+        ("Traceback: AssertionError in test_foo", False),
+        ("could not find the file", False),
+    ],
+)
+def test_is_transient_failure(message: str, expected: bool) -> None:
+    assert fd._is_transient_failure(message) is expected
+
+
+def test_transient_failures_do_not_count_toward_attempt_cap(tmp_path: Path) -> None:
+    led = Ledger(tmp_path / "l.jsonl")
+    # Two transient (deferred) runs and one real failure.
+    led.record("fleet_dispatch", "dispatch", "deferred", candidate="r#1", branch="b")
+    led.record("fleet_dispatch", "dispatch", "failed", candidate="r#1", branch="b")
+    led.record("fleet_dispatch", "dispatch", "deferred", candidate="r#1", branch="b")
+
+    a = fd._last_attempt(led, "r#1")
+    assert a is not None
+    assert a.outcome == "deferred"  # latest
+    assert a.attempt_number == 1  # only the real "failed" counts, not the two deferred
+
+
+def test_failed_entry_with_transient_message_does_not_count(tmp_path: Path) -> None:
+    # Defends against "failed" entries recorded before transient classification
+    # existed (exactly the two rate-limited #17 runs in the live ledger): a
+    # failure whose message is transient must not count toward the cap.
+    led = Ledger(tmp_path / "l.jsonl")
+    led.record("fleet_dispatch", "dispatch", "failed", candidate="r#1", branch="b",
+               final_message="You've hit your session limit · resets 6pm")
+    led.record("fleet_dispatch", "dispatch", "failed", candidate="r#1", branch="b",
+               final_message="You've hit your session limit · resets 6pm")
+
+    a = fd._last_attempt(led, "r#1")
+    assert a is not None
+    assert a.attempt_number == 0  # both transient -> neither counts
+
+
+def test_dispatch_decision_deferred_always_resumes() -> None:
+    # Even a long string of transient deferrals never escalates to a human,
+    # because attempt_number excludes them (here it's 0).
+    deferred = fd.Attempt("r#1", "deferred", "b", 0)
+    assert fd._dispatch_decision(deferred, blocker_open=False, max_attempts=3) == "resume"
+
+
+def test_main_resumes_or_skips_by_prior_attempt(tmp_path: Path, monkeypatch) -> None:
+    got: dict[str, object] = {}
+
+    def fake_dispatch_one(
+        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+    ):
+        got[candidate.id] = prior
+
+    monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+
+    candidates = [
+        fd.Candidate(id="r#1", repo="r", tool="", title="resume", kind="issue", created_at="2020-01-01"),
+        fd.Candidate(id="r#2", repo="r", tool="", title="blocked", kind="issue", created_at="2020-01-02"),
+        fd.Candidate(id="r#3", repo="r", tool="", title="capped", kind="issue", created_at="2020-01-03"),
+        fd.Candidate(id="r#4", repo="r", tool="", title="fresh", kind="issue", created_at="2020-01-04"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+
+    attempts = {
+        "r#1": fd.Attempt("r#1", "needs_review", "b1", 1),
+        "r#2": fd.Attempt("r#2", "blocked", "b2", 1, blocker="MyThingsLab/core#9"),
+        "r#3": fd.Attempt("r#3", "failed", "b3", 3),  # at the attempt cap
+    }
+    monkeypatch.setattr(fd, "_last_attempt", lambda ledger, cid: attempts.get(cid))
+    monkeypatch.setattr(fd, "_issue_is_open", lambda ref: True)  # r#2's blocker still open
+
+    rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
+
+    assert rc == 0
+    # r#2 (blocked, still open) and r#3 (hit cap) skipped; r#1 resumed, r#4 fresh.
+    assert set(got) == {"r#1", "r#4"}
+    assert got["r#1"] is attempts["r#1"]  # resumed with its prior attempt
+    assert got["r#4"] is None  # fresh
+    # r#3 hitting the cap is recorded as needs_human so it stays skipped.
+    outcomes = [e.outcome for e in Ledger(tmp_path / "ledger.jsonl") if e.data.get("candidate") == "r#3"]
+    assert "needs_human" in outcomes
+
+
+# --- deny-reads shrink what a worker may read ------------------------------
+
+
+def test_default_deny_reads_cover_noise_dirs_not_source() -> None:
+    joined = " ".join(fd.DEFAULT_DENY_READS)
+    assert "Read(**/.venv/**)" in fd.DEFAULT_DENY_READS
+    assert "Read(**/__pycache__/**)" in fd.DEFAULT_DENY_READS
+    assert "Read(**/dev-ledger/**)" in fd.DEFAULT_DENY_READS
+    # Source and tests must never be denied -- the worker needs to read them.
+    assert "src" not in joined
+    assert "tests" not in joined
+
+
+def test_prompt_requires_draft_pr_and_checklist() -> None:
+    candidate = fd.Candidate(
+        id="myrepo#7", repo="myrepo", tool="", title="t", kind="issue", created_at=""
+    )
+    prompt = fd._prompt_for(candidate)
+    assert "--draft" in prompt
+    assert "Closes #7" in prompt
+    assert "do NOT mark it ready" in prompt
+
+
+# --- PR merge-readiness: draft promoted only on checklist + green CI --------
+
+
+def test_pr_body_ok_requires_closes_and_checked_box() -> None:
+    ok, _ = fd._pr_body_ok("Closes #7\n- [x] pytest passes", "7")
+    assert ok is True
+
+
+def test_pr_body_ok_rejects_missing_closes() -> None:
+    ok, why = fd._pr_body_ok("- [x] pytest passes", "7")
+    assert ok is False
+    assert "Closes #7" in why
+
+
+def test_pr_body_ok_rejects_unchecked_checklist() -> None:
+    ok, why = fd._pr_body_ok("Closes #7\n- [ ] pytest passes", "7")
+    assert ok is False
+    assert "checklist" in why
+
+
+@pytest.mark.parametrize(
+    ("buckets", "expected"),
+    [
+        ("", "none"),
+        ("pass\npass", "pass"),
+        ("pass\nskipping", "pass"),
+        ("pass\npending", "pending"),
+        ("pass\nfail", "fail"),
+        ("cancel", "fail"),
+    ],
+)
+def test_checks_state_collapses_buckets(monkeypatch, buckets: str, expected: str) -> None:
+    monkeypatch.setattr(
+        fd.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=buckets, stderr=""),
+    )
+    assert fd._checks_state("org", "repo", 1) == expected
+
+
+def test_wait_for_checks_returns_pending_on_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(fd, "_checks_state", lambda *a, **k: "pending")
+    # timeout=0 -> a single check, no sleeping; still-running stays 'pending'.
+    assert fd._wait_for_checks("org", "repo", 1, timeout=0) == "pending"
+
+
+def test_finalize_pr_promotes_and_succeeds_when_body_ok_and_ci_green(monkeypatch) -> None:
+    promoted: list[int] = []
+    monkeypatch.setattr(fd, "_pr_body", lambda *a, **k: "Closes #7\n- [x] pytest passes")
+    monkeypatch.setattr(fd, "_wait_for_checks", lambda *a, **k: "pass")
+    monkeypatch.setattr(fd, "_promote_pr", lambda org, repo, n: promoted.append(n))
+
+    outcome, _ = fd._finalize_pr("org", "repo", "7", 42, ready_timeout=0)
+
+    # Success -- the only path that maps to a mergeable, promoted PR.
+    assert outcome == "success"
+    assert promoted == [42]
+
+
+def test_finalize_pr_needs_review_and_stays_draft_when_ci_fails(monkeypatch) -> None:
+    promoted: list[int] = []
+    monkeypatch.setattr(fd, "_pr_body", lambda *a, **k: "Closes #7\n- [x] pytest passes")
+    monkeypatch.setattr(fd, "_wait_for_checks", lambda *a, **k: "fail")
+    monkeypatch.setattr(fd, "_promote_pr", lambda org, repo, n: promoted.append(n))
+
+    outcome, msg = fd._finalize_pr("org", "repo", "7", 42, ready_timeout=0)
+
+    assert outcome == "needs_review"
+    assert "CI failing" in msg
+    assert promoted == []
+
+
+def test_finalize_pr_needs_review_when_body_incomplete(monkeypatch) -> None:
+    promoted: list[int] = []
+    monkeypatch.setattr(fd, "_pr_body", lambda *a, **k: "no closes line here")
+    monkeypatch.setattr(fd, "_wait_for_checks", lambda *a, **k: "pass")
+    monkeypatch.setattr(fd, "_promote_pr", lambda org, repo, n: promoted.append(n))
+
+    outcome, _ = fd._finalize_pr("org", "repo", "7", 42, ready_timeout=0)
+
+    assert outcome == "needs_review"
+    assert promoted == []  # a green CI never promotes a PR whose body is incomplete
+
+
+def test_finalize_pr_needs_review_when_no_ci_checks(monkeypatch) -> None:
+    monkeypatch.setattr(fd, "_pr_body", lambda *a, **k: "Closes #7\n- [x] pytest passes")
+    monkeypatch.setattr(fd, "_wait_for_checks", lambda *a, **k: "none")
+
+    outcome, _ = fd._finalize_pr("org", "repo", "7", 42, ready_timeout=0)
+
+    assert outcome == "needs_review"
