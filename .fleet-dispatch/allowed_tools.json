@@ -1,0 +1,21 @@
+[
+  "Read",
+  "Edit",
+  "Write",
+  "Bash(git *)",
+  "Bash(pytest*)",
+  "Bash(python -m pytest*)",
+  "Bash(python3 -m pytest*)",
+  "Bash(ruff*)",
+  "Bash(python -m ruff*)",
+  "Bash(python3 -m ruff*)",
+  "Bash(ls*)",
+  "Bash(cat*)",
+  "Bash(head*)",
+  "Bash(tail*)",
+  "Bash(wc*)",
+  "Bash(grep*)",
+  "Bash(gh issue view*)",
+  "Bash(gh pr create*)",
+  "Bash(gh issue create*)"
+]
