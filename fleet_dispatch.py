@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -66,6 +67,23 @@ def _load_allowed_tools() -> list[str]:
     return list(DEFAULT_ALLOWED_TOOLS)
 
 
+def _with_rtk_allowlist(tools: list[str]) -> list[str]:
+    # rtk's hook rewrites `git status` -> `rtk git status` (it prepends `rtk `).
+    # Verified against rtk 0.43.0: its PreToolUse hook returns `updatedInput`
+    # only -- NO `permissionDecision: allow` -- so the rewritten command is NOT
+    # self-allowed and must independently satisfy the worker's --allowedTools, or
+    # a headless worker stalls on a denied command. The denial auto-widen in
+    # _record_usage can't recover it either (it would re-add `Bash(git *)`, not
+    # the `rtk`-prefixed form). Mirror each Bash(X) entry with Bash(rtk X) so the
+    # compact form is allowed exactly where the original was, never broader.
+    mirrored = list(tools)
+    for t in tools:
+        if t.startswith("Bash(") and t.endswith(")"):
+            inner = t[len("Bash(") : -1]
+            mirrored.append(f"Bash(rtk {inner})")
+    return mirrored
+
+
 def _save_allowed_tools(tools: list[str], *, commit_message: str) -> None:
     ALLOWED_TOOLS_PATH.parent.mkdir(parents=True, exist_ok=True)
     ALLOWED_TOOLS_PATH.write_text(json.dumps(tools, indent=2))
@@ -98,6 +116,42 @@ def _parse_accounts(raw: str) -> list[Account]:
     return accounts
 
 
+def _config_dir_has_rtk_hook(config_dir: Path) -> bool:
+    # rtk installs itself with `rtk init -g` into a CLAUDE_CONFIG_DIR: it writes
+    # a PreToolUse hook to settings.json that rewrites commands to their compact
+    # `rtk` equivalents. We never write that hook ourselves — rtk owns it, and
+    # its schema is versioned — we only read settings.json to confirm a worker
+    # spawned under this dir will actually inherit the compression. The hook is
+    # self-guarding (exits 0 if rtk/jq is missing), so this check is about
+    # "compression is wired", not safety.
+    settings = config_dir / "settings.json"
+    if not settings.is_file():
+        return False
+    try:
+        data = json.loads(settings.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False
+    hooks = data.get("hooks", {}).get("PreToolUse", [])
+    return "rtk" in json.dumps(hooks)
+
+
+def _preflight_rtk(accounts: list[Account]) -> list[str]:
+    # Read-only. Returns human-readable problems; an empty list means rtk
+    # compression is correctly wired for every account. Refusing to --execute
+    # on a non-empty result is the point: a paid run must never silently skip
+    # the compression you asked for.
+    problems = []
+    if shutil.which("rtk") is None:
+        problems.append("`rtk` is not on PATH — install it and run `rtk init -g --hook-only`")
+    for account in accounts:
+        if not _config_dir_has_rtk_hook(account.config_dir):
+            problems.append(
+                f"{account.name} ({account.config_dir}) has no rtk PreToolUse hook — "
+                f"run `CLAUDE_CONFIG_DIR={account.config_dir} rtk init -g --hook-only`"
+            )
+    return problems
+
+
 def _prompt_for(candidate: Candidate) -> str:
     repo, number = candidate.id.split("#")
     return (
@@ -118,7 +172,7 @@ def _branch_name(candidate: Candidate) -> str:
 
 def _record_usage(
     report: UsageReport, *, account: Account, candidate: Candidate, transcript_path: Path,
-    ledger: Ledger,
+    ledger: Ledger, rtk: bool = False,
 ) -> None:
     ledger.record(
         tool="fleet_dispatch",
@@ -137,6 +191,10 @@ def _record_usage(
         wasted_output_tokens=report.wasted_output_tokens,
         denials_count=len(report.denials),
         transcript_path=str(transcript_path),
+        # Marks whether rtk output compression was active for this run, so
+        # rtk-on vs rtk-off `kind=usage` entries can be diffed after the fact --
+        # the "measure it, don't assume it" half of the rtk integration.
+        rtk=rtk,
     )
     if report.denials:
         print(
@@ -190,7 +248,13 @@ def _record_usage(
 
 
 def _dispatch_one(
-    account: Account, candidate: Candidate, *, execute: bool, max_budget_usd: float, ledger: Ledger
+    account: Account,
+    candidate: Candidate,
+    *,
+    execute: bool,
+    max_budget_usd: float,
+    ledger: Ledger,
+    rtk: bool = False,
 ) -> None:
     repo, _number = candidate.id.split("#")
     repo_path = WORKSPACE_ROOT / repo
@@ -217,6 +281,10 @@ def _dispatch_one(
         branch=branch,
     )
 
+    allowed_tools = _load_allowed_tools()
+    if rtk:
+        allowed_tools = _with_rtk_allowlist(allowed_tools)
+
     with Workspace(repo_path, base_ref="main") as tree:
         subprocess.run(["git", "-C", str(tree), "checkout", "-b", branch], check=True)
         env = {**os.environ, "CLAUDE_CONFIG_DIR": str(account.config_dir)}
@@ -231,7 +299,7 @@ def _dispatch_one(
                 "--max-budget-usd",
                 str(max_budget_usd),
                 "--allowedTools",
-                *_load_allowed_tools(),
+                *allowed_tools,
             ],
             cwd=tree,
             env=env,
@@ -245,7 +313,7 @@ def _dispatch_one(
         report = parse_transcript(result.stdout.splitlines())
         _record_usage(
             report, account=account, candidate=candidate, transcript_path=transcript_path,
-            ledger=ledger,
+            ledger=ledger, rtk=rtk,
         )
 
         if result.returncode != 0:
@@ -298,6 +366,15 @@ def main(argv: list[str] | None = None) -> int:
         "(each must already be `claude auth login`'d)",
     )
     parser.add_argument("--execute", action="store_true", help="actually launch headless sessions")
+    parser.add_argument(
+        "--rtk",
+        action="store_true",
+        help="enable rtk output compression: preflight-verify the rtk hook is "
+        "installed in every account's config dir (never installs it — rtk's own "
+        "`rtk init -g` owns that), and mirror each Bash(X) allowlist entry with "
+        "Bash(rtk X) so the hook's rewritten `rtk <cmd>` commands still pass the "
+        "headless worker's --allowedTools",
+    )
     parser.add_argument("--org", default="MyThingsLab")
     parser.add_argument(
         "--max-budget-usd",
@@ -310,6 +387,15 @@ def main(argv: list[str] | None = None) -> int:
     accounts = _parse_accounts(args.accounts)
     if not accounts:
         parser.error("--accounts must list at least one CLAUDE_CONFIG_DIR")
+
+    if args.rtk:
+        problems = _preflight_rtk(accounts)
+        if problems:
+            print("rtk compression requested (--rtk) but not wired:")
+            for p in problems:
+                print(f"  - {p}")
+            return 1
+        print("rtk output-compression hook verified for every account")
 
     orch = Orchestrator(
         org=args.org,
@@ -336,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
             execute=args.execute,
             max_budget_usd=args.max_budget_usd,
             ledger=dispatch_ledger,
+            rtk=args.rtk,
         )
     for account in accounts[len(dispatchable) :]:
         print(f"\n=== {account.name}: no ready issue candidate ===")
