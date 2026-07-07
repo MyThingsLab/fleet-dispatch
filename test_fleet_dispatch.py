@@ -9,7 +9,7 @@ import pytest
 from mythings.ledger import Ledger
 
 import fleet_dispatch as fd
-from fleet_usage import UsageReport
+from fleet_usage import UsageReport, family_for
 
 
 def _account(config_dir: Path, settings: dict | None) -> fd.Account:
@@ -126,7 +126,7 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
     calls: list[tuple[str, float, float]] = []
     calls_lock = threading.Lock()
 
-    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, rtk=False):
+    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, org, rtk=False):
         start = time.monotonic()
         time.sleep(0.2)
         end = time.monotonic()
@@ -168,7 +168,7 @@ def test_main_surfaces_every_account_failure_not_just_first(
     # future and unwinds before the loop reaches the second, silently
     # dropping any other account's crash. Both accounts fail here on purpose;
     # both should still be reported.
-    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, rtk=False):
+    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, org, rtk=False):
         raise RuntimeError(f"boom-{account.name}")
 
     monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
@@ -197,3 +197,72 @@ def test_main_surfaces_every_account_failure_not_just_first(
     assert rc == 1
     assert "boom-account1" in out
     assert "boom-account2" in out
+
+
+# --- A: honest success detection -------------------------------------------
+
+
+def test_dispatch_outcome_no_commits_is_not_success() -> None:
+    outcome, msg = fd._dispatch_outcome(0, None)
+    assert outcome == "no_changes"
+    assert "committed nothing" in msg
+
+
+def test_dispatch_outcome_commits_without_pr_needs_review() -> None:
+    outcome, msg = fd._dispatch_outcome(2, None)
+    assert outcome == "needs_review"
+    assert "no PR" in msg
+
+
+def test_dispatch_outcome_commits_and_pr_is_success() -> None:
+    outcome, msg = fd._dispatch_outcome(3, 22)
+    assert outcome == "success"
+    assert "#22" in msg
+
+
+# --- B: read-only shell recognised, mutation stays friction ----------------
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("ls -la docs/tools/", "ls"),
+        ("rtk ls docs/tools/", "ls"),
+        ("cat README.md", "cat"),
+        ("grep -rn foo .", "grep"),
+        ("rtk grep -rl bar .", "grep"),
+        ("head -20 f.py", "head"),
+        ("git status", "git"),
+        ("rtk git status", "git"),  # rtk-prefixed git now classifies correctly
+        ("gh pr view 1", "gh"),
+        ("python -m pytest -q", "pytest"),
+        # Mutating / code-running commands must NOT be recognised -> friction.
+        ("rm conftest.py", None),
+        ("pip install -e .", None),
+        ("python -c 'import mythings'", None),
+        ("find . -delete", None),
+    ],
+)
+def test_family_for_readonly_vs_mutation(command: str, expected: str | None) -> None:
+    assert family_for(command) == expected
+
+
+def test_default_allowed_tools_has_readonly_not_mutation() -> None:
+    assert "Bash(ls*)" in fd.DEFAULT_ALLOWED_TOOLS
+    assert "Bash(grep*)" in fd.DEFAULT_ALLOWED_TOOLS
+    # Never proactively allow mutation/code-execution.
+    assert "Bash(rm*)" not in fd.DEFAULT_ALLOWED_TOOLS
+    assert "Bash(find*)" not in fd.DEFAULT_ALLOWED_TOOLS
+
+
+# --- C: prompt tells the worker it is non-interactive ----------------------
+
+
+def test_prompt_is_noninteractive_and_prefers_native_tools() -> None:
+    candidate = fd.Candidate(
+        id="myrepo#7", repo="myrepo", tool="", title="t", kind="issue", created_at=""
+    )
+    prompt = fd._prompt_for(candidate)
+    assert "non-interactively" in prompt
+    assert "will never come" in prompt
+    assert "Read" in prompt

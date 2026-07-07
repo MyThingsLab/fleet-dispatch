@@ -15,23 +15,48 @@ from dataclasses import dataclass, field
 # families is safe to auto-approve a wider phrasing for (fleet_dispatch.py
 # widens its own allowlist to the family's full pattern set). Anything else
 # stays a friction signal for a human to look at — no auto-widen.
+#
+# The read-only families (ls/cat/head/tail/wc/grep) are pure inspection: they
+# don't mutate the tree, so widening them unattended is safe. `find` is
+# deliberately NOT here (its -delete/-exec can mutate) and neither is anything
+# that runs code (python -c), installs (pip), or removes (rm) — those stay
+# friction. Workers are told to prefer their native Read/Glob/Grep tools
+# anyway (see _prompt_for); these entries just keep an insistent shell caller
+# from dead-ending on a denial instead of getting the work done.
 SAFE_FAMILY_PATTERNS: dict[str, list[str]] = {
     "pytest": ["Bash(pytest*)", "Bash(python -m pytest*)", "Bash(python3 -m pytest*)"],
     "ruff": ["Bash(ruff*)", "Bash(python -m ruff*)", "Bash(python3 -m ruff*)"],
     "git": ["Bash(git *)"],
     "gh": ["Bash(gh issue view*)", "Bash(gh pr create*)"],
+    "ls": ["Bash(ls*)"],
+    "cat": ["Bash(cat*)"],
+    "head": ["Bash(head*)"],
+    "tail": ["Bash(tail*)"],
+    "wc": ["Bash(wc*)"],
+    "grep": ["Bash(grep*)"],
 }
+
+_READ_ONLY_FAMILIES = ("ls", "cat", "head", "tail", "wc", "grep")
 
 
 def family_for(command: str) -> str | None:
+    stripped = command.strip()
+    # rtk rewrites `<cmd>` -> `rtk <cmd>`; classify by the underlying command so
+    # a denied `rtk git ...` / `rtk ls ...` maps to the same family as the bare
+    # form (the old startswith("git ") check missed the rtk-prefixed variants).
+    if stripped.startswith("rtk "):
+        stripped = stripped[len("rtk ") :].lstrip()
     if "pytest" in command:
         return "pytest"
     if "ruff" in command:
         return "ruff"
-    if command.startswith("git "):
+    first = stripped.split(maxsplit=1)[0] if stripped else ""
+    if first == "git":
         return "git"
-    if command.startswith("gh "):
+    if first == "gh":
         return "gh"
+    if first in _READ_ONLY_FAMILIES:
+        return first
     return None
 
 
@@ -53,6 +78,11 @@ class UsageReport:
     cache_read_input_tokens: int = 0
     num_turns: int = 0
     denials: list[Denial] = field(default_factory=list)
+    # The headless session's final `result` string. When a worker gives up
+    # without doing the work (e.g. "please approve `ls` so I can continue"),
+    # this is the only record of *why*, so fleet_dispatch surfaces it on a
+    # no-changes outcome instead of silently calling the run a success.
+    final_message: str = ""
 
     @property
     def wasted_output_tokens(self) -> int:
@@ -118,4 +148,5 @@ def parse_transcript(lines: list[str]) -> UsageReport:
         cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
         num_turns=result_obj.get("num_turns", turn),
         denials=denials,
+        final_message=str(result_obj.get("result", "")),
     )

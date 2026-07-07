@@ -58,6 +58,17 @@ DEFAULT_ALLOWED_TOOLS = [
     "Bash(ruff*)",
     "Bash(python -m ruff*)",
     "Bash(python3 -m ruff*)",
+    # Read-only inspection: workers reach for these to look around even though
+    # they have native Read/Glob/Grep tools; allowing the non-mutating ones up
+    # front stops a run from dead-ending on a denied `ls`/`grep` (see the
+    # SAFE_FAMILY_PATTERNS note in fleet_usage.py). `find`/`rm`/`pip`/`python -c`
+    # are intentionally absent — those can mutate or run code and stay friction.
+    "Bash(ls*)",
+    "Bash(cat*)",
+    "Bash(head*)",
+    "Bash(tail*)",
+    "Bash(wc*)",
+    "Bash(grep*)",
     "Bash(gh issue view*)",
     "Bash(gh pr create*)",
 ]
@@ -165,6 +176,12 @@ def _prompt_for(candidate: Candidate) -> str:
     return (
         f"Work issue #{number} in the {repo} repo (`gh issue view {number} --repo "
         f"MyThingsLab/{repo}` for the full description; title: {candidate.title!r}).\n\n"
+        f"You are running fully non-interactively, as a headless `claude -p` "
+        f"session: no human is watching and no one can approve a permission "
+        f"prompt. If a command is denied, do NOT ask for approval or wait for it — "
+        f"it will never come. Work only with the tools you already have, and prefer "
+        f"your Read, Edit, Write, Glob and Grep tools over shelling out to `ls`, "
+        f"`cat`, `find` or `grep` to inspect the repo.\n\n"
         f"Follow this repo's own CLAUDE.md and HARNESS.md exactly. Make the smallest "
         f"change that closes the issue, with tests. Run the repo's test suite and "
         f"linter before finishing. Commit your work, then open a pull request with "
@@ -172,6 +189,31 @@ def _prompt_for(candidate: Candidate) -> str:
         f"merge the PR yourself. Stay inside this repo; do not touch any other repo "
         f"in the workspace."
     )
+
+
+def _dispatch_outcome(n_commits: int, pr_number: int | None) -> tuple[str, str]:
+    # Translates what actually landed into an honest ledger outcome. A headless
+    # worker exiting 0 is NOT proof it did the work -- it may have given up (e.g.
+    # asked for a permission approval no one was there to grant). "success"
+    # requires a real commit AND an open PR; anything less says so plainly.
+    if n_commits == 0:
+        return "no_changes", "worker committed nothing; branch left unpushed"
+    if pr_number is None:
+        return "needs_review", "committed but no PR was opened; branch pushed for review"
+    return "success", f"opened PR #{pr_number}"
+
+
+def _open_pr_number(org: str, repo: str, branch: str) -> int | None:
+    result = subprocess.run(
+        [
+            "gh", "pr", "list", "--repo", f"{org}/{repo}", "--head", branch,
+            "--state", "open", "--json", "number", "--jq", ".[0].number // empty",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    out = result.stdout.strip()
+    return int(out) if out.isdigit() else None
 
 
 def _branch_name(candidate: Candidate) -> str:
@@ -263,6 +305,7 @@ def _dispatch_one(
     execute: bool,
     max_budget_usd: float,
     ledger: Ledger,
+    org: str,
     rtk: bool = False,
 ) -> None:
     repo, _number = candidate.id.split("#")
@@ -301,6 +344,13 @@ def _dispatch_one(
 
     with Workspace(repo_path, base_ref="main") as tree:
         subprocess.run(["git", "-C", str(tree), "checkout", "-b", branch], check=True)
+        # Snapshot the branch point now, so "did the worker commit anything?" is
+        # measured against where it started -- not the `main` ref, which another
+        # concurrent dispatch could advance underneath us.
+        base_sha = subprocess.run(
+            ["git", "-C", str(tree), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
         env = {**os.environ, "CLAUDE_CONFIG_DIR": str(account.config_dir)}
         result = subprocess.run(
             [
@@ -342,6 +392,39 @@ def _dispatch_one(
                 branch=branch,
             )
             return
+
+        # A clean exit code is not proof of work. Gate on a real commit before
+        # pushing anything: a worker that gave up (asked for an approval no one
+        # could grant) exits 0 with the branch untouched, and pushing that dead
+        # branch + logging "success" is the false positive this guards against.
+        n_commits = int(
+            subprocess.run(
+                ["git", "-C", str(tree), "rev-list", "--count", f"{base_sha}..HEAD"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            or "0"
+        )
+        if n_commits == 0:
+            outcome, msg = _dispatch_outcome(0, None)
+            tail = (
+                f" (worker's last words: {report.final_message[:160]!r})"
+                if report.final_message
+                else ""
+            )
+            print(f"  [{account.name}] {msg}{tail}")
+            ledger.record(
+                tool="fleet_dispatch",
+                kind="dispatch",
+                outcome=outcome,
+                detail=f"{account.name} -> {candidate.id}: {msg}",
+                candidate=candidate.id,
+                account=account.name,
+                branch=branch,
+                final_message=report.final_message[:500],
+                denials_count=len(report.denials),
+            )
+            return
+
         push = subprocess.run(
             ["git", "-C", str(tree), "push", "-u", "origin", branch],
             capture_output=True,
@@ -358,17 +441,25 @@ def _dispatch_one(
                 account=account.name,
                 branch=branch,
             )
-        else:
-            print(f"  [{account.name}] pushed {branch}; PR should already be open via gh pr create")
-            ledger.record(
-                tool="fleet_dispatch",
-                kind="dispatch",
-                outcome="success",
-                detail=f"{account.name} -> {candidate.id}: pushed {branch}",
-                candidate=candidate.id,
-                account=account.name,
-                branch=branch,
-            )
+            return
+
+        # Pushed with real commits -- but the worker owns `gh pr create`, so
+        # confirm a PR actually exists before calling it a success rather than
+        # trusting the prompt was followed.
+        pr_number = _open_pr_number(org, repo, branch)
+        outcome, msg = _dispatch_outcome(n_commits, pr_number)
+        print(f"  [{account.name}] pushed {branch} ({n_commits} commit(s)): {msg}")
+        ledger.record(
+            tool="fleet_dispatch",
+            kind="dispatch",
+            outcome=outcome,
+            detail=f"{account.name} -> {candidate.id}: {msg}",
+            candidate=candidate.id,
+            account=account.name,
+            branch=branch,
+            commits=n_commits,
+            pr_number=pr_number,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -445,6 +536,7 @@ def main(argv: list[str] | None = None) -> int:
                     execute=args.execute,
                     max_budget_usd=args.max_budget_usd,
                     ledger=dispatch_ledger,
+                    org=args.org,
                     rtk=args.rtk,
                 ): (account, candidate)
                 for account, candidate in pairs
