@@ -1,0 +1,2 @@
+{"data":{"account":"account1","branch":"fleet-dispatch/mythings-core-8","candidate":"mythings-core#8"},"detail":"account1 -> mythings-core#8","kind":"dispatch","outcome":"started","tool":"fleet_dispatch","ts":"2026-07-07T03:17:09Z"}
+{"data":{"account":"account1","branch":"fleet-dispatch/mythings-core-8","candidate":"mythings-core#8"},"detail":"account1 -> mythings-core#8: pushed fleet-dispatch/mythings-core-8","kind":"dispatch","outcome":"success","tool":"fleet_dispatch","ts":"2026-07-07T03:19:09Z"}

@@ -1,0 +1,26 @@
+# Each of these is its own independent git repo (its own remote, history,
+# CI) -- ignored here rather than embedded, so this repo only tracks the
+# workspace-level tooling that lives loose at the root.
+my-changelogger/
+my-guard/
+my-orchestrator/
+my-reporter/
+my-telegram-bot/
+my-template/
+my-tester/
+mythings-core/
+
+.venv/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+# Claude Code's local session state for this workspace -- not part of the
+# fleet-dispatch tooling this repo tracks.
+.claude/
+
+# Raw per-run transcripts and pre-git backup copies -- large/verbose and
+# superseded by real git history for allowed_tools.json now that this repo
+# exists. The ledger keeps a pointer to each transcript's path regardless.
+.fleet-dispatch/transcripts/
+.fleet-dispatch/backups/
