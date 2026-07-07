@@ -192,6 +192,45 @@ def _preflight_rtk(accounts: list[Account]) -> list[str]:
     return problems
 
 
+def _account_uuid(config_dir: Path) -> str | None:
+    # The account a config dir is logged into is recorded by `claude auth login`
+    # in .claude.json under oauthAccount. Read-only; no token is touched.
+    try:
+        data = json.loads((config_dir / ".claude.json").read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return (data.get("oauthAccount") or {}).get("accountUuid") or None
+
+
+def _preflight_distinct_accounts(accounts: list[Account]) -> list[str]:
+    # The whole premise is that each config dir is a *different* Claude account,
+    # so the workers don't share one session window / usage quota. Two dirs that
+    # resolve to the same accountUuid silently void that -- both drain the one
+    # account, "concurrency" buys nothing, and one hits its limit twice as fast.
+    # This is invisible without checking (they're separate directories with
+    # separate tokens), so verify identity before spending anything.
+    problems: list[str] = []
+    seen: dict[str, str] = {}  # accountUuid -> the first account name that had it
+    for account in accounts:
+        uuid = _account_uuid(account.config_dir)
+        if uuid is None:
+            problems.append(
+                f"{account.name} ({account.config_dir}): can't read an account identity "
+                f"from .claude.json — is it `claude auth login`'d?"
+            )
+            continue
+        if uuid in seen:
+            problems.append(
+                f"{account.name} ({account.config_dir}) is the SAME Claude account as "
+                f"{seen[uuid]} (accountUuid {uuid[:8]}…) — they would share one session "
+                f"and quota. Re-auth one to a different account: "
+                f"`CLAUDE_CONFIG_DIR={account.config_dir} claude auth login`."
+            )
+        else:
+            seen[uuid] = account.name
+    return problems
+
+
 def _prompt_for(
     candidate: Candidate, prior: Attempt | None = None, *, has_branch: bool = False
 ) -> str:
@@ -721,6 +760,16 @@ def main(argv: list[str] | None = None) -> int:
     accounts = _parse_accounts(args.accounts)
     if not accounts:
         parser.error("--accounts must list at least one CLAUDE_CONFIG_DIR")
+
+    # A fleet of accounts that are secretly the same account is not a fleet.
+    # Always gate on distinct identities -- cheap, local, and it prevents silently
+    # draining one account twice (which is exactly what happened once).
+    account_problems = _preflight_distinct_accounts(accounts)
+    if account_problems:
+        print("account preflight failed — the configured accounts are not distinct:")
+        for p in account_problems:
+            print(f"  - {p}")
+        return 1
 
     if args.rtk:
         problems = _preflight_rtk(accounts)

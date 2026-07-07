@@ -84,6 +84,47 @@ def test_preflight_clean_when_all_wired(tmp_path: Path, monkeypatch) -> None:
     assert fd._preflight_rtk([account]) == []
 
 
+def _account_with_uuid(config_dir: Path, uuid: str | None) -> fd.Account:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    if uuid is not None:
+        (config_dir / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"accountUuid": uuid, "emailAddress": "x@y"}})
+        )
+    return fd.Account(name=config_dir.name, config_dir=config_dir)
+
+
+def test_account_uuid_reads_or_none(tmp_path: Path) -> None:
+    a = _account_with_uuid(tmp_path / "a", "uuid-123")
+    assert fd._account_uuid(a.config_dir) == "uuid-123"
+    assert fd._account_uuid(tmp_path / "missing") is None
+    (tmp_path / "bad").mkdir()
+    (tmp_path / "bad" / ".claude.json").write_text("{not json")
+    assert fd._account_uuid(tmp_path / "bad") is None
+
+
+def test_preflight_distinct_accounts_flags_same_account(tmp_path: Path) -> None:
+    # The exact footgun: two config dirs logged into the same account.
+    a = _account_with_uuid(tmp_path / "a", "same-uuid")
+    b = _account_with_uuid(tmp_path / "b", "same-uuid")
+    problems = fd._preflight_distinct_accounts([a, b])
+    assert len(problems) == 1
+    assert "SAME Claude account" in problems[0]
+
+
+def test_preflight_distinct_accounts_clean_when_different(tmp_path: Path) -> None:
+    a = _account_with_uuid(tmp_path / "a", "uuid-a")
+    b = _account_with_uuid(tmp_path / "b", "uuid-b")
+    assert fd._preflight_distinct_accounts([a, b]) == []
+
+
+def test_preflight_distinct_accounts_flags_unreadable_identity(tmp_path: Path) -> None:
+    a = _account_with_uuid(tmp_path / "a", "uuid-a")
+    b = _account_with_uuid(tmp_path / "b", None)  # no .claude.json
+    problems = fd._preflight_distinct_accounts([a, b])
+    assert len(problems) == 1
+    assert "can't read an account identity" in problems[0]
+
+
 def test_with_rtk_allowlist_mirrors_bash_entries_only() -> None:
     tools = ["Read", "Edit", "Bash(git *)", "Bash(pytest*)"]
 
@@ -165,6 +206,7 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
             return [FakeRecommendation(c) for c in candidates]
 
     monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
     monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
 
     rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
@@ -207,6 +249,7 @@ def test_main_surfaces_every_account_failure_not_just_first(
             return [FakeRecommendation(c) for c in candidates]
 
     monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
     monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
 
     rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
@@ -247,6 +290,7 @@ def test_main_skips_issue_with_open_pr_in_flight(tmp_path: Path, monkeypatch) ->
             return [FakeRecommendation(c) for c in candidates]
 
     monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
     # repo#1's branch already has an open PR (#99); repo#2's does not.
     monkeypatch.setattr(
         fd,
@@ -515,6 +559,7 @@ def test_main_resumes_or_skips_by_prior_attempt(tmp_path: Path, monkeypatch) -> 
             return [FakeRecommendation(c) for c in candidates]
 
     monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
 
     attempts = {
         "r#1": fd.Attempt("r#1", "needs_review", "b1", 1),
