@@ -22,6 +22,8 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +40,12 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent
 DISPATCH_LEDGER = WORKSPACE_ROOT / ".fleet-dispatch" / "ledger.jsonl"
 ALLOWED_TOOLS_PATH = WORKSPACE_ROOT / ".fleet-dispatch" / "allowed_tools.json"
 TRANSCRIPTS_DIR = WORKSPACE_ROOT / ".fleet-dispatch" / "transcripts"
+
+# Guards the read-modify-write of allowed_tools.json and its commit in
+# WORKSPACE_ROOT: concurrent dispatches now run in parallel threads, and two
+# threads self-widening the allowlist at once would race on the file and on
+# `git commit` (a second commit while one is mid-flight fails on index.lock).
+_ALLOWLIST_LOCK = threading.Lock()
 
 DEFAULT_ALLOWED_TOOLS = [
     "Read",
@@ -202,49 +210,50 @@ def _record_usage(
             f"~{report.wasted_output_tokens} output tokens wasted"
         )
 
-    tools = _load_allowed_tools()
-    all_added: list[str] = []
-    for d in report.denials:
-        family = family_for(d.command) if d.tool_name == "Bash" else None
-        if family is None:
-            ledger.record(
-                tool="fleet_dispatch",
-                kind="friction",
-                outcome="needs_review",
-                detail=f"unrecognized denied command, no auto-widen: {d.command!r}",
-                candidate=candidate.id,
-                turn=d.turn,
-                preceding_reasoning=d.preceding_reasoning,
+    with _ALLOWLIST_LOCK:
+        tools = _load_allowed_tools()
+        all_added: list[str] = []
+        for d in report.denials:
+            family = family_for(d.command) if d.tool_name == "Bash" else None
+            if family is None:
+                ledger.record(
+                    tool="fleet_dispatch",
+                    kind="friction",
+                    outcome="needs_review",
+                    detail=f"unrecognized denied command, no auto-widen: {d.command!r}",
+                    candidate=candidate.id,
+                    turn=d.turn,
+                    preceding_reasoning=d.preceding_reasoning,
+                )
+                print(f"  [{account.name}] friction (needs human review): {d.command!r}")
+                continue
+            missing = [p for p in SAFE_FAMILY_PATTERNS[family] if p not in tools]
+            if missing:
+                tools.extend(missing)
+                all_added.extend(missing)
+                ledger.record(
+                    tool="fleet_dispatch",
+                    kind="self_edit",
+                    outcome="widened_allowlist",
+                    detail=f"auto-widened '{family}' family after a denial: added {missing}",
+                    candidate=candidate.id,
+                    added=missing,
+                    triggering_command=d.command,
+                    turn=d.turn,
+                    preceding_reasoning=d.preceding_reasoning,
+                )
+                print(f"  [{account.name}] self-widened allowlist ({family}): +{missing}")
+        if all_added:
+            _save_allowed_tools(
+                tools,
+                commit_message=(
+                    f"fleet_dispatch: auto-widen allowlist after {candidate.id} denials\n\n"
+                    f"Added: {all_added}\n"
+                    f"Triggered by {len(report.denials)} permission denial(s) dispatching "
+                    f"{account.name} -> {candidate.id}. See .fleet-dispatch/ledger.jsonl "
+                    f"(kind=self_edit) for the reasoning behind each addition."
+                ),
             )
-            print(f"  [{account.name}] friction (needs human review): {d.command!r}")
-            continue
-        missing = [p for p in SAFE_FAMILY_PATTERNS[family] if p not in tools]
-        if missing:
-            tools.extend(missing)
-            all_added.extend(missing)
-            ledger.record(
-                tool="fleet_dispatch",
-                kind="self_edit",
-                outcome="widened_allowlist",
-                detail=f"auto-widened '{family}' family after a denial: added {missing}",
-                candidate=candidate.id,
-                added=missing,
-                triggering_command=d.command,
-                turn=d.turn,
-                preceding_reasoning=d.preceding_reasoning,
-            )
-            print(f"  [{account.name}] self-widened allowlist ({family}): +{missing}")
-    if all_added:
-        _save_allowed_tools(
-            tools,
-            commit_message=(
-                f"fleet_dispatch: auto-widen allowlist after {candidate.id} denials\n\n"
-                f"Added: {all_added}\n"
-                f"Triggered by {len(report.denials)} permission denial(s) dispatching "
-                f"{account.name} -> {candidate.id}. See .fleet-dispatch/ledger.jsonl "
-                f"(kind=self_edit) for the reasoning behind each addition."
-            ),
-        )
 
 
 def _dispatch_one(
@@ -261,11 +270,16 @@ def _dispatch_one(
     branch = _branch_name(candidate)
     prompt = _prompt_for(candidate)
 
-    print(f"\n=== {account.name} -> {candidate.id} ({repo}) ===")
-    print(f"  branch: {branch}")
-    print(f"  config: {account.config_dir}")
-    print(f"  budget cap: ${max_budget_usd}")
-    print(f"  prompt: {prompt}")
+    # One print call, not several: with dispatches now running concurrently in
+    # separate threads, individual print()s from different accounts could
+    # otherwise interleave mid-block and produce unreadable output.
+    print(
+        f"\n=== {account.name} -> {candidate.id} ({repo}) ===\n"
+        f"  branch: {branch}\n"
+        f"  config: {account.config_dir}\n"
+        f"  budget cap: ${max_budget_usd}\n"
+        f"  prompt: {prompt}"
+    )
 
     if not execute:
         print("  [dry-run] not launched")
@@ -415,15 +429,29 @@ def main(argv: list[str] | None = None) -> int:
         print(f"skipping (need MyScaffolder, not built yet): {names}")
 
     dispatch_ledger = Ledger(DISPATCH_LEDGER)
-    for account, candidate in zip(accounts, dispatchable):
-        _dispatch_one(
-            account,
-            candidate,
-            execute=args.execute,
-            max_budget_usd=args.max_budget_usd,
-            ledger=dispatch_ledger,
-            rtk=args.rtk,
-        )
+    pairs = list(zip(accounts, dispatchable))
+    if pairs:
+        # One worker thread per account: each already runs in its own git
+        # worktree under its own CLAUDE_CONFIG_DIR (mythings.isolation.Workspace),
+        # so nothing about running them at the same time needs new isolation --
+        # only the shared allowlist self-edit does (see _ALLOWLIST_LOCK). The
+        # `with` block still waits for every dispatch to finish even if one
+        # raises, so a failing account can't cut the others short.
+        with ThreadPoolExecutor(max_workers=len(pairs)) as pool:
+            futures = [
+                pool.submit(
+                    _dispatch_one,
+                    account,
+                    candidate,
+                    execute=args.execute,
+                    max_budget_usd=args.max_budget_usd,
+                    ledger=dispatch_ledger,
+                    rtk=args.rtk,
+                )
+                for account, candidate in pairs
+            ]
+            for future in futures:
+                future.result()
     for account in accounts[len(dispatchable) :]:
         print(f"\n=== {account.name}: no ready issue candidate ===")
 

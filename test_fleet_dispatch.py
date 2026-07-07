@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -113,3 +115,47 @@ def test_record_usage_marks_whether_rtk_was_active(tmp_path: Path, rtk: bool) ->
     (entry,) = [e for e in ledger.read() if e.kind == "usage"]
     assert entry.data["rtk"] is rtk
     assert entry.data["input_tokens"] == 100
+
+
+def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> None:
+    # Regression test for the bug this fix closes: main()'s dispatch loop used
+    # to call _dispatch_one sequentially, so two accounts' work never
+    # overlapped in time. Stub _dispatch_one to block for a bit and record its
+    # own [start, end) window; if the loop is truly concurrent the two
+    # accounts' windows overlap, if it's sequential they can't.
+    calls: list[tuple[str, float, float]] = []
+    calls_lock = threading.Lock()
+
+    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, rtk=False):
+        start = time.monotonic()
+        time.sleep(0.2)
+        end = time.monotonic()
+        with calls_lock:
+            calls.append((account.name, start, end))
+
+    monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+
+    candidates = [
+        fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
+        fd.Candidate(id="repo#2", repo="repo", tool="", title="t2", kind="issue", created_at="2020-01-02"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+
+    rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
+
+    assert rc == 0
+    assert len(calls) == 2
+    (_name1, start1, end1), (_name2, start2, end2) = calls
+    assert start1 < end2 and start2 < end1
