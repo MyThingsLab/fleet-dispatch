@@ -343,7 +343,12 @@ def _dispatch_one(
         allowed_tools = _with_rtk_allowlist(allowed_tools)
 
     with Workspace(repo_path, base_ref="main") as tree:
-        subprocess.run(["git", "-C", str(tree), "checkout", "-b", branch], check=True)
+        # -B, not -b: a leftover local branch ref from a prior aborted/no-op run
+        # (the temp worktree is gone but its `checkout -b` ref persists in the
+        # shared .git) must not crash a fresh dispatch. Resetting it to this
+        # worktree's detached-main HEAD is safe -- any branch that still has real
+        # work in flight was already filtered out by the open-PR skip in main().
+        subprocess.run(["git", "-C", str(tree), "checkout", "-B", branch], check=True)
         # Snapshot the branch point now, so "did the worker commit anything?" is
         # measured against where it started -- not the `main` ref, which another
         # concurrent dispatch could advance underneath us.
@@ -518,6 +523,20 @@ def main(argv: list[str] | None = None) -> int:
     if skipped:
         names = ", ".join(c.id for c in skipped)
         print(f"skipping (need MyScaffolder, not built yet): {names}")
+
+    # Don't re-dispatch an issue that already has an open fleet-dispatch PR in
+    # flight: the orchestrator ranks open issues without knowing one is already
+    # being handled, and re-running it just burns an account to open a second,
+    # duplicate PR for the same issue.
+    in_flight = [
+        c for c in dispatchable
+        if _open_pr_number(args.org, c.repo, _branch_name(c)) is not None
+    ]
+    if in_flight:
+        ids = {c.id for c in in_flight}
+        names = ", ".join(sorted(ids))
+        print(f"skipping (already has an open fleet-dispatch PR): {names}")
+        dispatchable = [c for c in dispatchable if c.id not in ids]
 
     dispatch_ledger = Ledger(DISPATCH_LEDGER)
     pairs = list(zip(accounts, dispatchable))

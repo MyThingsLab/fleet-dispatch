@@ -152,6 +152,7 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
             return [FakeRecommendation(c) for c in candidates]
 
     monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
 
     rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
 
@@ -190,6 +191,7 @@ def test_main_surfaces_every_account_failure_not_just_first(
             return [FakeRecommendation(c) for c in candidates]
 
     monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
 
     rc = fd.main(["--accounts", f"{tmp_path / 'a'},{tmp_path / 'b'}"])
 
@@ -197,6 +199,47 @@ def test_main_surfaces_every_account_failure_not_just_first(
     assert rc == 1
     assert "boom-account1" in out
     assert "boom-account2" in out
+
+
+def test_main_skips_issue_with_open_pr_in_flight(tmp_path: Path, monkeypatch) -> None:
+    # An issue that already has an open fleet-dispatch PR must not be handed to
+    # an account again -- otherwise a second, duplicate PR gets opened for it.
+    dispatched: list[str] = []
+
+    def fake_dispatch_one(account, candidate, *, execute, max_budget_usd, ledger, org, rtk=False):
+        dispatched.append(candidate.id)
+
+    monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+
+    candidates = [
+        fd.Candidate(id="repo#1", repo="repo", tool="", title="done", kind="issue", created_at="2020-01-01"),
+        fd.Candidate(id="repo#2", repo="repo", tool="", title="todo", kind="issue", created_at="2020-01-02"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    # repo#1's branch already has an open PR (#99); repo#2's does not.
+    monkeypatch.setattr(
+        fd,
+        "_open_pr_number",
+        lambda org, repo, branch: 99 if branch == fd._branch_name(candidates[0]) else None,
+    )
+
+    rc = fd.main(["--accounts", f"{tmp_path / 'a'}"])
+
+    assert rc == 0
+    # The single account should get repo#2 (todo), never the in-flight repo#1.
+    assert dispatched == ["repo#2"]
 
 
 # --- A: honest success detection -------------------------------------------
