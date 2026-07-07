@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+from mythings.ledger import Ledger
+
 import fleet_dispatch as fd
+from fleet_usage import UsageReport
 
 
 def _account(config_dir: Path, settings: dict | None) -> fd.Account:
@@ -86,3 +90,26 @@ def test_with_rtk_allowlist_rewritten_command_would_match() -> None:
     # Bash(rtk git *) is what makes that pass the allowlist.
     mirrored = fd._with_rtk_allowlist(["Bash(git *)"])
     assert "Bash(rtk git *)" in mirrored
+
+
+@pytest.mark.parametrize("rtk", [True, False])
+def test_record_usage_marks_whether_rtk_was_active(tmp_path: Path, rtk: bool) -> None:
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    report = UsageReport(cost_usd=0.01, input_tokens=100, output_tokens=20, num_turns=1)
+    account = fd.Account(name="account1", config_dir=tmp_path)
+    candidate = fd.Candidate(
+        id="myrepo#1", repo="myrepo", tool="", title="t", kind="issue", created_at=""
+    )
+
+    fd._record_usage(
+        report,
+        account=account,
+        candidate=candidate,
+        transcript_path=tmp_path / "t.jsonl",
+        ledger=ledger,
+        rtk=rtk,
+    )
+
+    (entry,) = [e for e in ledger.read() if e.kind == "usage"]
+    assert entry.data["rtk"] is rtk
+    assert entry.data["input_tokens"] == 100

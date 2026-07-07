@@ -69,10 +69,12 @@ def _load_allowed_tools() -> list[str]:
 
 def _with_rtk_allowlist(tools: list[str]) -> list[str]:
     # rtk's hook rewrites `git status` -> `rtk git status` (it prepends `rtk `).
-    # The rewritten command still has to satisfy the worker's --allowedTools or a
-    # headless worker stalls on a denied command -- and the denial auto-widen in
-    # _record_usage can't recover it (it would re-add `Bash(git *)`, not the
-    # `rtk`-prefixed form). Mirror each Bash(X) entry with Bash(rtk X) so the
+    # Verified against rtk 0.43.0: its PreToolUse hook returns `updatedInput`
+    # only -- NO `permissionDecision: allow` -- so the rewritten command is NOT
+    # self-allowed and must independently satisfy the worker's --allowedTools, or
+    # a headless worker stalls on a denied command. The denial auto-widen in
+    # _record_usage can't recover it either (it would re-add `Bash(git *)`, not
+    # the `rtk`-prefixed form). Mirror each Bash(X) entry with Bash(rtk X) so the
     # compact form is allowed exactly where the original was, never broader.
     mirrored = list(tools)
     for t in tools:
@@ -170,7 +172,7 @@ def _branch_name(candidate: Candidate) -> str:
 
 def _record_usage(
     report: UsageReport, *, account: Account, candidate: Candidate, transcript_path: Path,
-    ledger: Ledger,
+    ledger: Ledger, rtk: bool = False,
 ) -> None:
     ledger.record(
         tool="fleet_dispatch",
@@ -189,6 +191,10 @@ def _record_usage(
         wasted_output_tokens=report.wasted_output_tokens,
         denials_count=len(report.denials),
         transcript_path=str(transcript_path),
+        # Marks whether rtk output compression was active for this run, so
+        # rtk-on vs rtk-off `kind=usage` entries can be diffed after the fact --
+        # the "measure it, don't assume it" half of the rtk integration.
+        rtk=rtk,
     )
     if report.denials:
         print(
@@ -307,7 +313,7 @@ def _dispatch_one(
         report = parse_transcript(result.stdout.splitlines())
         _record_usage(
             report, account=account, candidate=candidate, transcript_path=transcript_path,
-            ledger=ledger,
+            ledger=ledger, rtk=rtk,
         )
 
         if result.returncode != 0:
