@@ -22,6 +22,8 @@ import json
 import os
 import shutil
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +41,12 @@ DISPATCH_LEDGER = WORKSPACE_ROOT / ".fleet-dispatch" / "ledger.jsonl"
 ALLOWED_TOOLS_PATH = WORKSPACE_ROOT / ".fleet-dispatch" / "allowed_tools.json"
 TRANSCRIPTS_DIR = WORKSPACE_ROOT / ".fleet-dispatch" / "transcripts"
 
+# Guards the read-modify-write of allowed_tools.json and its commit in
+# WORKSPACE_ROOT: concurrent dispatches now run in parallel threads, and two
+# threads self-widening the allowlist at once would race on the file and on
+# `git commit` (a second commit while one is mid-flight fails on index.lock).
+_ALLOWLIST_LOCK = threading.Lock()
+
 DEFAULT_ALLOWED_TOOLS = [
     "Read",
     "Edit",
@@ -50,6 +58,17 @@ DEFAULT_ALLOWED_TOOLS = [
     "Bash(ruff*)",
     "Bash(python -m ruff*)",
     "Bash(python3 -m ruff*)",
+    # Read-only inspection: workers reach for these to look around even though
+    # they have native Read/Glob/Grep tools; allowing the non-mutating ones up
+    # front stops a run from dead-ending on a denied `ls`/`grep` (see the
+    # SAFE_FAMILY_PATTERNS note in fleet_usage.py). `find`/`rm`/`pip`/`python -c`
+    # are intentionally absent — those can mutate or run code and stay friction.
+    "Bash(ls*)",
+    "Bash(cat*)",
+    "Bash(head*)",
+    "Bash(tail*)",
+    "Bash(wc*)",
+    "Bash(grep*)",
     "Bash(gh issue view*)",
     "Bash(gh pr create*)",
 ]
@@ -91,12 +110,21 @@ def _save_allowed_tools(tools: list[str], *, commit_message: str) -> None:
     # replaces the pre-git backup-copy approach, and `git revert` is the way
     # back out if a widened pattern turns out to be wrong. The ledger entry
     # that explains *why* rides along in the same commit.
+    #
+    # Commit with an explicit pathspec, NOT a bare `git commit`: WORKSPACE_ROOT
+    # is a live checkout that may have unrelated staged changes, and a bare
+    # commit would sweep them into this self-edit. The pathspec form commits a
+    # snapshot of exactly these two files and leaves anything else staged alone.
     subprocess.run(
         ["git", "-C", str(WORKSPACE_ROOT), "add", str(ALLOWED_TOOLS_PATH), str(DISPATCH_LEDGER)],
         check=True,
     )
     subprocess.run(
-        ["git", "-C", str(WORKSPACE_ROOT), "commit", "-m", commit_message], check=True
+        [
+            "git", "-C", str(WORKSPACE_ROOT), "commit", "-m", commit_message,
+            "--", str(ALLOWED_TOOLS_PATH), str(DISPATCH_LEDGER),
+        ],
+        check=True,
     )
 
 
@@ -157,6 +185,12 @@ def _prompt_for(candidate: Candidate) -> str:
     return (
         f"Work issue #{number} in the {repo} repo (`gh issue view {number} --repo "
         f"MyThingsLab/{repo}` for the full description; title: {candidate.title!r}).\n\n"
+        f"You are running fully non-interactively, as a headless `claude -p` "
+        f"session: no human is watching and no one can approve a permission "
+        f"prompt. If a command is denied, do NOT ask for approval or wait for it — "
+        f"it will never come. Work only with the tools you already have, and prefer "
+        f"your Read, Edit, Write, Glob and Grep tools over shelling out to `ls`, "
+        f"`cat`, `find` or `grep` to inspect the repo.\n\n"
         f"Follow this repo's own CLAUDE.md and HARNESS.md exactly. Make the smallest "
         f"change that closes the issue, with tests. Run the repo's test suite and "
         f"linter before finishing. Commit your work, then open a pull request with "
@@ -164,6 +198,31 @@ def _prompt_for(candidate: Candidate) -> str:
         f"merge the PR yourself. Stay inside this repo; do not touch any other repo "
         f"in the workspace."
     )
+
+
+def _dispatch_outcome(n_commits: int, pr_number: int | None) -> tuple[str, str]:
+    # Translates what actually landed into an honest ledger outcome. A headless
+    # worker exiting 0 is NOT proof it did the work -- it may have given up (e.g.
+    # asked for a permission approval no one was there to grant). "success"
+    # requires a real commit AND an open PR; anything less says so plainly.
+    if n_commits == 0:
+        return "no_changes", "worker committed nothing; branch left unpushed"
+    if pr_number is None:
+        return "needs_review", "committed but no PR was opened; branch pushed for review"
+    return "success", f"opened PR #{pr_number}"
+
+
+def _open_pr_number(org: str, repo: str, branch: str) -> int | None:
+    result = subprocess.run(
+        [
+            "gh", "pr", "list", "--repo", f"{org}/{repo}", "--head", branch,
+            "--state", "open", "--json", "number", "--jq", ".[0].number // empty",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    out = result.stdout.strip()
+    return int(out) if out.isdigit() else None
 
 
 def _branch_name(candidate: Candidate) -> str:
@@ -202,49 +261,50 @@ def _record_usage(
             f"~{report.wasted_output_tokens} output tokens wasted"
         )
 
-    tools = _load_allowed_tools()
-    all_added: list[str] = []
-    for d in report.denials:
-        family = family_for(d.command) if d.tool_name == "Bash" else None
-        if family is None:
-            ledger.record(
-                tool="fleet_dispatch",
-                kind="friction",
-                outcome="needs_review",
-                detail=f"unrecognized denied command, no auto-widen: {d.command!r}",
-                candidate=candidate.id,
-                turn=d.turn,
-                preceding_reasoning=d.preceding_reasoning,
+    with _ALLOWLIST_LOCK:
+        tools = _load_allowed_tools()
+        all_added: list[str] = []
+        for d in report.denials:
+            family = family_for(d.command) if d.tool_name == "Bash" else None
+            if family is None:
+                ledger.record(
+                    tool="fleet_dispatch",
+                    kind="friction",
+                    outcome="needs_review",
+                    detail=f"unrecognized denied command, no auto-widen: {d.command!r}",
+                    candidate=candidate.id,
+                    turn=d.turn,
+                    preceding_reasoning=d.preceding_reasoning,
+                )
+                print(f"  [{account.name}] friction (needs human review): {d.command!r}")
+                continue
+            missing = [p for p in SAFE_FAMILY_PATTERNS[family] if p not in tools]
+            if missing:
+                tools.extend(missing)
+                all_added.extend(missing)
+                ledger.record(
+                    tool="fleet_dispatch",
+                    kind="self_edit",
+                    outcome="widened_allowlist",
+                    detail=f"auto-widened '{family}' family after a denial: added {missing}",
+                    candidate=candidate.id,
+                    added=missing,
+                    triggering_command=d.command,
+                    turn=d.turn,
+                    preceding_reasoning=d.preceding_reasoning,
+                )
+                print(f"  [{account.name}] self-widened allowlist ({family}): +{missing}")
+        if all_added:
+            _save_allowed_tools(
+                tools,
+                commit_message=(
+                    f"fleet_dispatch: auto-widen allowlist after {candidate.id} denials\n\n"
+                    f"Added: {all_added}\n"
+                    f"Triggered by {len(report.denials)} permission denial(s) dispatching "
+                    f"{account.name} -> {candidate.id}. See .fleet-dispatch/ledger.jsonl "
+                    f"(kind=self_edit) for the reasoning behind each addition."
+                ),
             )
-            print(f"  [{account.name}] friction (needs human review): {d.command!r}")
-            continue
-        missing = [p for p in SAFE_FAMILY_PATTERNS[family] if p not in tools]
-        if missing:
-            tools.extend(missing)
-            all_added.extend(missing)
-            ledger.record(
-                tool="fleet_dispatch",
-                kind="self_edit",
-                outcome="widened_allowlist",
-                detail=f"auto-widened '{family}' family after a denial: added {missing}",
-                candidate=candidate.id,
-                added=missing,
-                triggering_command=d.command,
-                turn=d.turn,
-                preceding_reasoning=d.preceding_reasoning,
-            )
-            print(f"  [{account.name}] self-widened allowlist ({family}): +{missing}")
-    if all_added:
-        _save_allowed_tools(
-            tools,
-            commit_message=(
-                f"fleet_dispatch: auto-widen allowlist after {candidate.id} denials\n\n"
-                f"Added: {all_added}\n"
-                f"Triggered by {len(report.denials)} permission denial(s) dispatching "
-                f"{account.name} -> {candidate.id}. See .fleet-dispatch/ledger.jsonl "
-                f"(kind=self_edit) for the reasoning behind each addition."
-            ),
-        )
 
 
 def _dispatch_one(
@@ -254,6 +314,7 @@ def _dispatch_one(
     execute: bool,
     max_budget_usd: float,
     ledger: Ledger,
+    org: str,
     rtk: bool = False,
 ) -> None:
     repo, _number = candidate.id.split("#")
@@ -261,11 +322,16 @@ def _dispatch_one(
     branch = _branch_name(candidate)
     prompt = _prompt_for(candidate)
 
-    print(f"\n=== {account.name} -> {candidate.id} ({repo}) ===")
-    print(f"  branch: {branch}")
-    print(f"  config: {account.config_dir}")
-    print(f"  budget cap: ${max_budget_usd}")
-    print(f"  prompt: {prompt}")
+    # One print call, not several: with dispatches now running concurrently in
+    # separate threads, individual print()s from different accounts could
+    # otherwise interleave mid-block and produce unreadable output.
+    print(
+        f"\n=== {account.name} -> {candidate.id} ({repo}) ===\n"
+        f"  branch: {branch}\n"
+        f"  config: {account.config_dir}\n"
+        f"  budget cap: ${max_budget_usd}\n"
+        f"  prompt: {prompt}"
+    )
 
     if not execute:
         print("  [dry-run] not launched")
@@ -286,7 +352,19 @@ def _dispatch_one(
         allowed_tools = _with_rtk_allowlist(allowed_tools)
 
     with Workspace(repo_path, base_ref="main") as tree:
-        subprocess.run(["git", "-C", str(tree), "checkout", "-b", branch], check=True)
+        # -B, not -b: a leftover local branch ref from a prior aborted/no-op run
+        # (the temp worktree is gone but its `checkout -b` ref persists in the
+        # shared .git) must not crash a fresh dispatch. Resetting it to this
+        # worktree's detached-main HEAD is safe -- any branch that still has real
+        # work in flight was already filtered out by the open-PR skip in main().
+        subprocess.run(["git", "-C", str(tree), "checkout", "-B", branch], check=True)
+        # Snapshot the branch point now, so "did the worker commit anything?" is
+        # measured against where it started -- not the `main` ref, which another
+        # concurrent dispatch could advance underneath us.
+        base_sha = subprocess.run(
+            ["git", "-C", str(tree), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
         env = {**os.environ, "CLAUDE_CONFIG_DIR": str(account.config_dir)}
         result = subprocess.run(
             [
@@ -328,6 +406,39 @@ def _dispatch_one(
                 branch=branch,
             )
             return
+
+        # A clean exit code is not proof of work. Gate on a real commit before
+        # pushing anything: a worker that gave up (asked for an approval no one
+        # could grant) exits 0 with the branch untouched, and pushing that dead
+        # branch + logging "success" is the false positive this guards against.
+        n_commits = int(
+            subprocess.run(
+                ["git", "-C", str(tree), "rev-list", "--count", f"{base_sha}..HEAD"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            or "0"
+        )
+        if n_commits == 0:
+            outcome, msg = _dispatch_outcome(0, None)
+            tail = (
+                f" (worker's last words: {report.final_message[:160]!r})"
+                if report.final_message
+                else ""
+            )
+            print(f"  [{account.name}] {msg}{tail}")
+            ledger.record(
+                tool="fleet_dispatch",
+                kind="dispatch",
+                outcome=outcome,
+                detail=f"{account.name} -> {candidate.id}: {msg}",
+                candidate=candidate.id,
+                account=account.name,
+                branch=branch,
+                final_message=report.final_message[:500],
+                denials_count=len(report.denials),
+            )
+            return
+
         push = subprocess.run(
             ["git", "-C", str(tree), "push", "-u", "origin", branch],
             capture_output=True,
@@ -344,17 +455,25 @@ def _dispatch_one(
                 account=account.name,
                 branch=branch,
             )
-        else:
-            print(f"  [{account.name}] pushed {branch}; PR should already be open via gh pr create")
-            ledger.record(
-                tool="fleet_dispatch",
-                kind="dispatch",
-                outcome="success",
-                detail=f"{account.name} -> {candidate.id}: pushed {branch}",
-                candidate=candidate.id,
-                account=account.name,
-                branch=branch,
-            )
+            return
+
+        # Pushed with real commits -- but the worker owns `gh pr create`, so
+        # confirm a PR actually exists before calling it a success rather than
+        # trusting the prompt was followed.
+        pr_number = _open_pr_number(org, repo, branch)
+        outcome, msg = _dispatch_outcome(n_commits, pr_number)
+        print(f"  [{account.name}] pushed {branch} ({n_commits} commit(s)): {msg}")
+        ledger.record(
+            tool="fleet_dispatch",
+            kind="dispatch",
+            outcome=outcome,
+            detail=f"{account.name} -> {candidate.id}: {msg}",
+            candidate=candidate.id,
+            account=account.name,
+            branch=branch,
+            commits=n_commits,
+            pr_number=pr_number,
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -414,22 +533,57 @@ def main(argv: list[str] | None = None) -> int:
         names = ", ".join(c.id for c in skipped)
         print(f"skipping (need MyScaffolder, not built yet): {names}")
 
+    # Don't re-dispatch an issue that already has an open fleet-dispatch PR in
+    # flight: the orchestrator ranks open issues without knowing one is already
+    # being handled, and re-running it just burns an account to open a second,
+    # duplicate PR for the same issue.
+    in_flight = [
+        c for c in dispatchable
+        if _open_pr_number(args.org, c.repo, _branch_name(c)) is not None
+    ]
+    if in_flight:
+        ids = {c.id for c in in_flight}
+        names = ", ".join(sorted(ids))
+        print(f"skipping (already has an open fleet-dispatch PR): {names}")
+        dispatchable = [c for c in dispatchable if c.id not in ids]
+
     dispatch_ledger = Ledger(DISPATCH_LEDGER)
-    for account, candidate in zip(accounts, dispatchable):
-        _dispatch_one(
-            account,
-            candidate,
-            execute=args.execute,
-            max_budget_usd=args.max_budget_usd,
-            ledger=dispatch_ledger,
-            rtk=args.rtk,
-        )
+    pairs = list(zip(accounts, dispatchable))
+    failures: list[tuple[Account, Candidate, BaseException]] = []
+    if pairs:
+        # One worker thread per account: each already runs in its own git
+        # worktree under its own CLAUDE_CONFIG_DIR (mythings.isolation.Workspace),
+        # so nothing about running them at the same time needs new isolation --
+        # only the shared allowlist self-edit does (see _ALLOWLIST_LOCK).
+        with ThreadPoolExecutor(max_workers=len(pairs)) as pool:
+            futures = {
+                pool.submit(
+                    _dispatch_one,
+                    account,
+                    candidate,
+                    execute=args.execute,
+                    max_budget_usd=args.max_budget_usd,
+                    ledger=dispatch_ledger,
+                    org=args.org,
+                    rtk=args.rtk,
+                ): (account, candidate)
+                for account, candidate in pairs
+            }
+            # future.exception() blocks until that future is done but, unlike
+            # future.result(), never raises -- so one account's crash can't
+            # stop us from also collecting every other account's outcome.
+            for future, (account, candidate) in futures.items():
+                exc = future.exception()
+                if exc is not None:
+                    failures.append((account, candidate, exc))
+    for account, candidate, exc in failures:
+        print(f"  [{account.name}] {candidate.id} crashed: {exc!r}")
     for account in accounts[len(dispatchable) :]:
         print(f"\n=== {account.name}: no ready issue candidate ===")
 
     if not args.execute:
         print("\n(dry run — pass --execute to actually launch these sessions)")
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
