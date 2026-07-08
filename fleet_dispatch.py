@@ -71,14 +71,25 @@ DEFAULT_ALLOWED_TOOLS = [
     # Read-only inspection: workers reach for these to look around even though
     # they have native Read/Glob/Grep tools; allowing the non-mutating ones up
     # front stops a run from dead-ending on a denied `ls`/`grep` (see the
-    # SAFE_FAMILY_PATTERNS note in fleet_usage.py). `find`/`rm`/`pip`/`python -c`
-    # are intentionally absent — those can mutate or run code and stay friction.
+    # SAFE_FAMILY_PATTERNS note in fleet_usage.py). `rm`/`pip`/`python -c` are
+    # intentionally absent — those can mutate or run code and stay friction.
+    # `find` also stays off this list even bare/unprefixed: allowedTools is a
+    # command-prefix match, and there is no prefix of `find . -name X -delete`
+    # (or `-exec ...`) that both matches real read-only usage and excludes the
+    # mutating one, so it stays friction like `rm`.
     "Bash(ls*)",
     "Bash(cat*)",
     "Bash(head*)",
     "Bash(tail*)",
     "Bash(wc*)",
     "Bash(grep*)",
+    "Bash(pwd*)",
+    "Bash(printenv*)",
+    "Bash(env)",
+    # Setup a worker routinely needs before it can run a repo's own tests: a
+    # local venv. `pip install` still isn't on this list, so the worker has to
+    # rely on the repo's checked-in dependencies once the venv exists.
+    "Bash(python3 -m venv*)",
     "Bash(gh issue view*)",
     "Bash(gh pr create*)",
     # Filing a blocker issue in another tool's repo when this one can't proceed
