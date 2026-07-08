@@ -30,7 +30,9 @@ jobs:
       - name: Install
         run: |
           pip install "my-things-core @ git+https://github.com/${{ github.repository_owner }}/my-things-core@main"
-          pip install "my-orchestrator @ git+https://github.com/${{ github.repository_owner }}/my-orchestrator@main"
+          # --no-deps: its only dep is the core installed above, but its main
+          # still names it "mythings-core" (pre-rename) which pip can't resolve.
+          pip install --no-deps "my-orchestrator @ git+https://github.com/${{ github.repository_owner }}/my-orchestrator@main"
           pip install pytest ruff
       - name: Ruff
         run: ruff check fleet_dispatch.py fleet_cycle.py fleet_usage.py test_fleet_dispatch.py
