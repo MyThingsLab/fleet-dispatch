@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "dev-ledger/**"]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths-ignore: ["**.md", "dev-ledger/**"]
+
+# Supersede in-flight runs when an agent pushes again to the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Skip while a PR is a draft; always run on pushes to main.
+    if: ${{ github.event_name == 'push' || github.event.pull_request.draft == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # This repo is scripts, not a package: pull the sibling SDK + orchestrator
+      # from the same owner (not on PyPI), plus the test/lint tools.
+      - name: Install
+        run: |
+          pip install "my-things-core @ git+https://github.com/${{ github.repository_owner }}/my-things-core@main"
+          # --no-deps: its only dep is the core installed above, but its main
+          # still names it "mythings-core" (pre-rename) which pip can't resolve.
+          pip install --no-deps "my-orchestrator @ git+https://github.com/${{ github.repository_owner }}/my-orchestrator@main"
+          pip install pytest ruff
+      - name: Ruff
+        run: ruff check fleet_dispatch.py fleet_cycle.py fleet_usage.py test_fleet_dispatch.py
+      - name: Tests
+        run: pytest test_fleet_dispatch.py
