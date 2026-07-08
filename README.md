@@ -4,13 +4,13 @@ A fleet of small, composable `My[X]` tools that develop GitHub repositories as
 autonomously as possible — deterministic code for everything except the
 handful of steps that genuinely need judgment, where exactly one `Engine` call
 is made. Every repo lives under the `MyThingsLab` GitHub org and imports the
-shared SDK, [`mythings-core`](mythings-core/).
+shared SDK, [`my-things-core`](my-things-core/).
 
 ## The fleet
 
 | Repo | Role | Authority |
 |---|---|---|
-| [mythings-core](mythings-core/) | SDK: `ledger`, `policy`, `engine`, `github`, `isolation` contracts. | none — every other tool imports it |
+| [my-things-core](my-things-core/) | SDK: `ledger`, `policy`, `engine`, `github`, `isolation` contracts. | none — every other tool imports it |
 | [my-guard](my-guard/) | Rule engine: evaluates an `Action` to allow/ask/deny. | policy for every `git`/`gh` side effect |
 | [my-planner](my-planner/) | Priority-ordered, multi-item plan across the whole backlog. | recommends a sequence; never dispatches |
 | [my-orchestrator](my-orchestrator/) | Picks the single next unit of work for the next available worker. | decides; never builds, never chains into another tool's CLI |
@@ -21,8 +21,13 @@ shared SDK, [`mythings-core`](mythings-core/).
 | [my-reporter](my-reporter/) | Digests the `Ledger` + every repo's `dev-ledger` into a report; can comment it on the tracking issue. | read-only |
 | [my-telegram-bot](my-telegram-bot/) | Pushes ledger notifications to Telegram; turns a `Policy` `ASK` into a real human confirmation. | comms only, fail-closed |
 
-Each tool's own `README.md`/`CLAUDE.md` is authoritative for its internals.
-This page narrates how they chain into one loop.
+The table lists the tools that drive the autonomous cycle; the fleet has more
+(`my-docs`, `my-researcher`, `my-todo`, `my-server`, `my-typster`, …) — every
+sibling `my-*/` directory is one tool, and the
+[fleet docs site](https://mythingslab.github.io) carries a page per tool,
+kept in sync by `my-docs`. Each tool's own `README.md`/`CLAUDE.md` is
+authoritative for its internals. This page narrates how they chain into one
+loop.
 
 ## The autonomous cycle
 
@@ -44,10 +49,17 @@ scripts at this root are the external drivers that chain them:
   3. `mytester run` (per repo) — add coverage for one uncovered unit.
   4. `mychangelogger update` (per repo) — fold new ledger entries into
      `CHANGELOG.md`.
-  5. `myprojector sync` — reconcile the org Project board + tracking-issue
+  5. `mydocs sync` — refresh the fleet docs site from each tool's
+     `README.md`/`CLAUDE.md` (deterministic hash check; opens, never merges,
+     one PR when pages are stale).
+  6. `myprojector sync` — reconcile the org Project board + tracking-issue
      checklist.
-  6. `myreporter post` — post a fleet-wide digest on the tracking issue.
-  7. `mytelegrambot notify` — push everything since the last notify.
+  7. `myreporter post` — post a fleet-wide digest on the tracking issue.
+  8. `mytelegrambot notify` — push everything since the last notify.
+
+  The per-repo steps auto-discover every checkout with a `pyproject.toml`
+  (except `my-template`), so a newly scaffolded tool joins the cycle without
+  editing the script.
 
 Every mutating side effect along the way — `git push`, `gh pr create`,
 tracking-issue edits — is wrapped as an `Action` routed through `Policy`
@@ -104,9 +116,10 @@ every package installed editable:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-for repo in mythings-core my-guard my-orchestrator my-planner my-projector \
-            my-tester my-changelogger my-reporter my-telegram-bot; do
-  pip install -e "$repo[dev]"
+pip install -e "my-things-core[dev]"
+for repo in my-*/; do
+  [ "$repo" = "my-template/" ] || [ ! -f "$repo/pyproject.toml" ] || \
+    pip install -e "${repo%/}[dev]"
 done
 ```
 
