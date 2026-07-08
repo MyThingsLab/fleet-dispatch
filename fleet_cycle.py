@@ -9,16 +9,17 @@ Order mirrors the authority chain each tool's CLAUDE.md already declares:
                            close them as PRs (existing script, reused as-is).
   3. mytester run        - per repo, add coverage for one uncovered unit.
   4. mychangelogger update - per repo, fold new dev-ledger entries into CHANGELOG.md.
-  5. myprojector sync    - reconcile the org Project board + tracking-issue checklist.
-  6. myreporter post     - post a fleet-wide digest comment on the tracking issue.
-  7. mytelegrambot notify - push everything since the last notify to Telegram.
+  5. mydocs sync         - refresh the fleet docs site from each tool's README/CLAUDE.md.
+  6. myprojector sync    - reconcile the org Project board + tracking-issue checklist.
+  7. myreporter post     - post a fleet-wide digest comment on the tracking issue.
+  8. mytelegrambot notify - push everything since the last notify to Telegram.
 
 No tool calls another tool's CLI directly (each stays a separate `gh`-attributed
 run, per their CLAUDE.md invariants) -- this script is the external driver that
 chains them, the same role fleet_dispatch.py already plays for orchestrator+workers.
 
 Defaults to a dry run (report only, no mutating subcommands). Pass --execute to
-actually run mytester/mychangelogger/myprojector/myreporter/mytelegrambot for
+actually run mytester/mychangelogger/mydocs/myprojector/myreporter/mytelegrambot for
 real; fleet_dispatch's own --execute is passed through separately since it
 spawns billed headless sessions.
 """
@@ -32,26 +33,25 @@ from pathlib import Path
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
 ORG = "MyThingsLab"
-TRACKING_REPO = f"{ORG}/mythings-core"
+TRACKING_REPO = f"{ORG}/my-things-core"
 TRACKING_ISSUE = "1"
 PROJECT_NUMBER = "1"
+DOCS_SITE_CLONE = "mythingslab-site-genesis"
 
-# Repos that get a mytester/mychangelogger pass: every shipped tool + the core
-# SDK. Excludes my-template (a scaffold, not a real tool) and non-Python repos.
-TOOL_REPOS = [
-    "mythings-core",
-    "my-orchestrator",
-    "my-guard",
-    "my-tester",
-    "my-changelogger",
-    "my-planner",
-    "my-projector",
-    "my-reporter",
-    "my-telegram-bot",
-    "my-researcher",
-    "my-todo",
-    "my-server",
-]
+# Repos that get a mytester/mychangelogger pass: every checkout with a
+# pyproject.toml (shipped tools + the core SDK), discovered at runtime so a
+# newly scaffolded tool joins the cycle without editing this list. Excludes
+# my-template (a scaffold, not a real tool); non-Python repos have no
+# pyproject.toml and never match.
+EXCLUDED_REPOS = {"my-template"}
+
+
+def tool_repos(root: Path) -> list[str]:
+    return sorted(
+        p.parent.name
+        for p in root.glob("*/pyproject.toml")
+        if p.parent.name not in EXCLUDED_REPOS
+    )
 
 
 def _run(cmd: list[str], *, check: bool = False) -> int:
@@ -91,10 +91,8 @@ def main(argv: list[str] | None = None) -> int:
         _run(dispatch_cmd)
 
     # 3-4. Per repo: add one test, fold the ledger into CHANGELOG.md.
-    for repo in TOOL_REPOS:
+    for repo in tool_repos(WORKSPACE_ROOT):
         repo_path = WORKSPACE_ROOT / repo
-        if not (repo_path / "pyproject.toml").exists():
-            continue
         tester_cmd = ["mytester", "run", "--source", str(repo_path), "--engine", args.engine]
         if not args.execute:
             tester_cmd.append("--local-only")
@@ -106,7 +104,23 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"(dry run — would run: {' '.join(changelogger_cmd)})")
 
-    # 5. MyProjector: reconcile the board + tracking-issue checklist.
+    # 5. MyDocs: refresh the fleet docs site from each tool's README/CLAUDE.md.
+    # Deterministically skips fresh pages (hash check), so this is cheap when
+    # nothing changed; it opens (never merges) one PR when pages are stale.
+    docs_site_root = WORKSPACE_ROOT / DOCS_SITE_CLONE
+    docs_cmd = [
+        "mydocs", "sync", "--all",
+        "--repo-root", str(docs_site_root),
+        "--engine", args.engine,
+    ]
+    if not docs_site_root.is_dir():
+        print(f"(skipping mydocs — no local docs-site clone at {docs_site_root})")
+    elif args.execute:
+        _run(docs_cmd)
+    else:
+        print(f"(dry run — would run: {' '.join(docs_cmd)})")
+
+    # 6. MyProjector: reconcile the board + tracking-issue checklist.
     projector_cmd = [
         "myprojector", "sync",
         "--org", ORG,
@@ -121,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         projector_cmd.append("--dry-run")
     _run(projector_cmd)
 
-    # 6. MyReporter: post the fleet-wide digest on the tracking issue.
+    # 7. MyReporter: post the fleet-wide digest on the tracking issue.
     reporter_cmd = [
         "myreporter", "post",
         "--repo", TRACKING_REPO,
@@ -135,14 +149,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"(dry run — would run: {' '.join(reporter_cmd)})")
 
-    # 7. MyTelegramBot: push everything since the last notify.
+    # 8. MyTelegramBot: push everything since the last notify.
     if args.execute:
         _run(["mytelegrambot", "notify"])
     else:
         print("(dry run — would run: mytelegrambot notify)")
 
     if not args.execute:
-        print("\n(dry run — pass --execute to run mytester/mychangelogger/myprojector/myreporter/mytelegrambot for real; --dispatch-execute for fleet_dispatch's billed sessions)")
+        print("\n(dry run — pass --execute to run mytester/mychangelogger/mydocs/myprojector/myreporter/mytelegrambot for real; --dispatch-execute for fleet_dispatch's billed sessions)")
     return 0
 
 
