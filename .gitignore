@@ -9,11 +9,24 @@ my-telegram-bot/
 my-template/
 my-tester/
 mythings-core/
+my-planner/
+my-projector/
+my-researcher/
+my-searcher/
+my-server/
+my-todo/
+my-uni/
+.github/
 
 .venv/
 .ruff_cache/
 __pycache__/
 *.py[cod]
+
+# Local runtime ledger from ad-hoc CLI runs against the workspace root
+# (e.g. myplanner/mytodo default --ledger path) -- not part of fleet-dispatch's
+# own dispatch ledger (.fleet-dispatch/ledger.jsonl), which is tracked.
+.mythings/
 
 # Claude Code's local session state for this workspace -- not part of the
 # fleet-dispatch tooling this repo tracks.
