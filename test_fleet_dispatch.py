@@ -4,10 +4,11 @@ import json
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
-from mythings.ledger import Ledger
+from mythings.ledger import Ledger, LedgerEntry
 
 import fleet_dispatch as fd
 from fleet_usage import UsageReport, family_for
@@ -178,7 +179,7 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
     calls_lock = threading.Lock()
 
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0
     ):
         start = time.monotonic()
         time.sleep(0.2)
@@ -225,7 +226,7 @@ def test_main_surfaces_every_account_failure_not_just_first(
     # dropping any other account's crash. Both accounts fail here on purpose;
     # both should still be reported.
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0
     ):
         raise RuntimeError(f"boom-{account.name}")
 
@@ -266,7 +267,7 @@ def test_main_skips_issue_with_open_pr_in_flight(tmp_path: Path, monkeypatch) ->
     dispatched: list[str] = []
 
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0
     ):
         dispatched.append(candidate.id)
 
@@ -532,7 +533,7 @@ def test_main_resumes_or_skips_by_prior_attempt(tmp_path: Path, monkeypatch) -> 
     got: dict[str, object] = {}
 
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0
     ):
         got[candidate.id] = prior
 
@@ -695,3 +696,153 @@ def test_finalize_pr_needs_review_when_no_ci_checks(monkeypatch) -> None:
     outcome, _ = fd._finalize_pr("org", "repo", "7", 42, ready_timeout=0)
 
     assert outcome == "needs_review"
+
+
+def _usage_entry(ledger: Ledger, *, cost_usd: float, ts: str) -> None:
+    ledger.append(
+        LedgerEntry(tool="fleet_dispatch", kind="usage", outcome="success", ts=ts, data={"cost_usd": cost_usd})
+    )
+
+
+def test_today_spend_usd_sums_only_todays_usage_entries(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    _usage_entry(ledger, cost_usd=1.5, ts="2026-07-10T01:00:00Z")
+    _usage_entry(ledger, cost_usd=2.25, ts="2026-07-10T02:00:00Z")
+    _usage_entry(ledger, cost_usd=99.0, ts="2026-07-09T23:59:59Z")  # yesterday, excluded
+
+    assert fd._today_spend_usd(ledger, today="2026-07-10") == pytest.approx(3.75)
+
+
+def test_today_spend_usd_ignores_non_usage_entries(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    ledger.record(tool="fleet_dispatch", kind="dispatch", outcome="success", cost_usd=50.0)
+
+    assert fd._today_spend_usd(ledger, today="2026-07-10") == 0.0
+
+
+def test_main_refuses_to_dispatch_over_daily_cap(tmp_path: Path, monkeypatch) -> None:
+    dispatch_ledger_path = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", dispatch_ledger_path)
+    ledger = Ledger(dispatch_ledger_path)
+    today = datetime.now(fd.UTC).strftime("%Y-%m-%d")
+    _usage_entry(ledger, cost_usd=19.0, ts=f"{today}T00:00:00Z")
+
+    called = False
+
+    def fake_dispatch_one(*a, **k):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
+
+    candidates = [
+        fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+
+    rc = fd.main(
+        [
+            "--accounts", str(tmp_path / "a"),
+            "--execute",
+            "--max-budget-usd", "3.0",
+            "--max-daily-usd", "20.0",
+        ]
+    )
+
+    assert rc == 1
+    assert called is False, "must refuse before spend, not launch and hope"
+
+
+def test_main_dry_run_ignores_daily_cap(tmp_path: Path, monkeypatch) -> None:
+    # A dry run spends nothing, so it must not be blocked by the cap -- the
+    # whole point of --dry-run is to report safely regardless of budget state.
+    dispatch_ledger_path = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", dispatch_ledger_path)
+    ledger = Ledger(dispatch_ledger_path)
+    today = datetime.now(fd.UTC).strftime("%Y-%m-%d")
+    _usage_entry(ledger, cost_usd=999.0, ts=f"{today}T00:00:00Z")
+
+    def fake_dispatch_one(*a, **k):
+        pass
+
+    monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
+
+    candidates = [
+        fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a")])
+
+    assert rc == 0
+
+
+def test_dispatch_one_passes_max_turns_and_max_budget_to_claude(tmp_path: Path, monkeypatch) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    _init_git_repo(repo_path)
+    subprocess.run(["git", "-C", str(repo_path), "branch", "-M", "main"], check=True)
+
+    monkeypatch.setattr(fd, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(fd, "TRANSCRIPTS_DIR", tmp_path / "transcripts")
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+
+    captured: dict = {}
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    candidate = fd.Candidate(
+        id="repo#1", repo="repo", tool="", title="t", kind="issue", created_at="2020-01-01"
+    )
+    account = _account(tmp_path / "cfg", {"model": "sonnet"})
+
+    fd._dispatch_one(
+        account,
+        candidate,
+        execute=True,
+        max_budget_usd=1.5,
+        max_turns=7,
+        ledger=Ledger(tmp_path / "ledger.jsonl"),
+        org="MyThingsLab",
+    )
+
+    argv = captured["argv"]
+    assert argv[argv.index("--max-turns") + 1] == "7"
+    assert argv[argv.index("--max-budget-usd") + 1] == "1.5"
