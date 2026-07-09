@@ -61,6 +61,16 @@ scripts at this root are the external drivers that chain them:
   (except `my-template`), so a newly scaffolded tool joins the cycle without
   editing the script.
 
+  `fleet_cycle.py --loop` keeps re-running that sequence instead of exiting
+  after one pass — meant for an always-on host, not an interactive session.
+  Each iteration re-derives the usable account pool
+  (`account_usage.select_accounts`, polled on a cadence rather than every
+  iteration) and backs off between iterations that dispatch nothing. It's
+  meant to be launched as a long-lived process (e.g. a systemd user service)
+  with `Restart=on-failure` handling crash recovery, not driven by this
+  script's own `--max-duration-min`/`--max-cycle-budget-usd`, which exist for
+  bounded manual runs instead.
+
 Every mutating side effect along the way — `git push`, `gh pr create`,
 tracking-issue edits — is wrapped as an `Action` routed through `Policy`
 (`my-guard`'s `Guard`, or a tool's own default). An `ASK` collapses to `DENY`
