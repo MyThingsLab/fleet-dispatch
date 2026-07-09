@@ -260,6 +260,54 @@ def test_main_surfaces_every_account_failure_not_just_first(
     assert "boom-account2" in out
 
 
+def test_critical_halt_issues_parses_gh_search_output(monkeypatch) -> None:
+    payload = [
+        {"repository": {"nameWithOwner": "MyThingsLab/my-things-core"}, "number": 5,
+         "title": "auth bypass", "url": "https://github.com/MyThingsLab/my-things-core/issues/5"},
+    ]
+
+    def fake_run(cmd, **kwargs):
+        assert cmd[:3] == ["gh", "search", "issues"]
+        assert "critical" in cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+    assert fd._critical_halt_issues("MyThingsLab") == payload
+
+
+def test_critical_halt_issues_empty_on_gh_failure(monkeypatch) -> None:
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not authenticated")
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+    assert fd._critical_halt_issues("MyThingsLab") == []
+
+
+def test_main_halts_dispatch_when_critical_issue_open(tmp_path: Path, monkeypatch, capsys) -> None:
+    critical = [
+        {"repository": {"nameWithOwner": "MyThingsLab/my-things-core"}, "number": 5,
+         "title": "auth bypass", "url": "https://github.com/MyThingsLab/my-things-core/issues/5"},
+    ]
+    monkeypatch.setattr(fd, "_critical_halt_issues", lambda org: critical)
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+
+    def boom_orchestrator(**_kwargs):
+        raise AssertionError("Orchestrator should not be constructed while halted")
+
+    monkeypatch.setattr(fd, "Orchestrator", boom_orchestrator)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a")])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "halted" in out
+    assert "my-things-core#5" in out
+
+    entries = list(Ledger(fd.DISPATCH_LEDGER))
+    assert entries[-1].outcome == "halted_critical"
+
+
 def test_main_skips_issue_with_open_pr_in_flight(tmp_path: Path, monkeypatch) -> None:
     # An issue that already has an open fleet-dispatch PR must not be handed to
     # an account again -- otherwise a second, duplicate PR gets opened for it.
