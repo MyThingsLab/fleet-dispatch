@@ -41,3 +41,8 @@ __pycache__/
 # exists. The ledger keeps a pointer to each transcript's path regardless.
 .fleet-dispatch/transcripts/
 .fleet-dispatch/backups/
+
+# The kill-switch marker: a local operational flag (--abort/--clear-halt),
+# not fleet state worth a commit. Committing it would "halt" the fleet for
+# everyone who pulls that commit and need a revert to undo.
+.fleet-dispatch/HALT

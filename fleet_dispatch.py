@@ -22,6 +22,10 @@ MAX_ATTEMPTS unresolved tries it's handed to a human.
 Each run ends at "draft PR opened", promoted to ready-for-review only once its
 checklist body and CI both check out — never pushes to main, never merges.
 Defaults to --dry-run; pass --execute to actually spawn the headless sessions.
+
+Kill switch: `--abort` touches a HALT marker (.fleet-dispatch/HALT) and exits;
+every subsequent --execute run refuses to launch anything until `--clear-halt`
+removes it. See README.md's "Kill switch" section for the one-line runbook.
 """
 
 from __future__ import annotations
@@ -50,6 +54,13 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent
 DISPATCH_LEDGER = WORKSPACE_ROOT / ".fleet-dispatch" / "ledger.jsonl"
 ALLOWED_TOOLS_PATH = WORKSPACE_ROOT / ".fleet-dispatch" / "allowed_tools.json"
 TRANSCRIPTS_DIR = WORKSPACE_ROOT / ".fleet-dispatch" / "transcripts"
+# The kill switch: a marker file, not a signal or a flag a running process has
+# to poll mid-loop. `--execute` checks for it before launching anything and
+# refuses outright if it's there, so arming it (`--abort`) always beats a run
+# that starts after it -- no race between "halt" and "launch". It doesn't
+# reach into an already-running headless session (those are already bounded by
+# --max-budget-usd/--max-turns and end on their own); it stops the *next* one.
+HALT_MARKER = WORKSPACE_ROOT / ".fleet-dispatch" / "HALT"
 
 # Guards the read-modify-write of allowed_tools.json and its commit in
 # WORKSPACE_ROOT: concurrent dispatches now run in parallel threads, and two
@@ -878,11 +889,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--accounts",
-        required=True,
         help="comma-separated CLAUDE_CONFIG_DIR paths, one per available worker "
-        "(each must already be `claude auth login`'d)",
+        "(each must already be `claude auth login`'d). Not required with "
+        "--abort/--clear-halt.",
     )
     parser.add_argument("--execute", action="store_true", help="actually launch headless sessions")
+    halt_group = parser.add_mutually_exclusive_group()
+    halt_group.add_argument(
+        "--abort",
+        action="store_true",
+        help="kill switch: touch the HALT marker and exit immediately (no "
+        "--accounts needed). Every subsequent --execute run refuses to launch "
+        "anything until --clear-halt runs.",
+    )
+    halt_group.add_argument(
+        "--clear-halt",
+        action="store_true",
+        help="remove the HALT marker and exit immediately, restoring normal "
+        "--execute operation.",
+    )
     parser.add_argument(
         "--rtk",
         action="store_true",
@@ -909,9 +934,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.abort:
+        HALT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        HALT_MARKER.write_text(f"halted at {_utc_ts()}\n")
+        print(
+            f"HALT marker armed at {HALT_MARKER} — every subsequent --execute run "
+            f"refuses to launch until `python3 fleet_dispatch.py --clear-halt` runs"
+        )
+        return 0
+
+    if args.clear_halt:
+        if HALT_MARKER.exists():
+            HALT_MARKER.unlink()
+            print(f"HALT marker cleared: {HALT_MARKER}")
+        else:
+            print("no HALT marker was set")
+        return 0
+
+    if not args.accounts:
+        parser.error("--accounts must list at least one CLAUDE_CONFIG_DIR")
+
     accounts = _parse_accounts(args.accounts)
     if not accounts:
         parser.error("--accounts must list at least one CLAUDE_CONFIG_DIR")
+
+    if HALT_MARKER.exists():
+        if args.execute:
+            print(
+                f"refusing to launch: HALT marker present at {HALT_MARKER} (fleet "
+                f"kill switch armed). Run `python3 fleet_dispatch.py --clear-halt` "
+                f"once it's safe to resume."
+            )
+            return 1
+        print(
+            f"note: HALT marker present at {HALT_MARKER} — this dry run still "
+            f"reports normally, but --execute would refuse until --clear-halt"
+        )
 
     # A fleet of accounts that are secretly the same account is not a fleet.
     # Always gate on distinct identities -- cheap, local, and it prevents silently
