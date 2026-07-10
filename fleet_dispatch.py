@@ -26,6 +26,11 @@ Defaults to --dry-run; pass --execute to actually spawn the headless sessions.
 Kill switch: `--abort` touches a HALT marker (.fleet-dispatch/HALT) and exits;
 every subsequent --execute run refuses to launch anything until `--clear-halt`
 removes it. See README.md's "Kill switch" section for the one-line runbook.
+
+Every headless session is bounded three ways: --max-budget-usd (spend),
+--max-turns (turn count), and --session-timeout-s (wall-clock time, in case a
+single turn stalls rather than exhausting its turn/budget cap). A timeout is
+recorded as a "deferred" outcome -- resumable, not counted toward MAX_ATTEMPTS.
 """
 
 from __future__ import annotations
@@ -712,6 +717,7 @@ def _dispatch_one(
     prior: Attempt | None = None,
     rtk: bool = False,
     ready_timeout: float = 0.0,
+    session_timeout_s: float = 1800.0,
 ) -> None:
     repo, number = candidate.id.split("#")
     repo_path = WORKSPACE_ROOT / repo
@@ -734,7 +740,8 @@ def _dispatch_one(
         f"\n=== {account.name} -> {candidate.id} ({repo}) [{mode}] ===\n"
         f"  branch: {branch} (base {base_ref})\n"
         f"  config: {account.config_dir}\n"
-        f"  budget cap: ${max_budget_usd}, turn cap: {max_turns}\n"
+        f"  budget cap: ${max_budget_usd}, turn cap: {max_turns}, "
+        f"session timeout: {session_timeout_s:.0f}s\n"
         f"  prompt: {prompt}"
     )
 
@@ -776,28 +783,47 @@ def _dispatch_one(
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         env = {**os.environ, "CLAUDE_CONFIG_DIR": str(account.config_dir)}
-        result = subprocess.run(
-            [
-                "claude",
-                "-p",
-                prompt,
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--max-budget-usd",
-                str(max_budget_usd),
-                "--max-turns",
-                str(max_turns),
-                "--disallowedTools",
-                *DEFAULT_DENY_READS,
-                "--allowedTools",
-                *allowed_tools,
-            ],
-            cwd=tree,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        # --max-budget-usd/--max-turns bound the session's spend and turn count,
+        # but neither bounds wall-clock time: a single stalled turn (network
+        # hang, or the exact "no one can approve a denied command" stall the
+        # prompt warns the worker about) would otherwise block this thread
+        # forever with no backstop. `timeout=` is that backstop; a timeout is an
+        # infrastructure hiccup, not evidence the issue itself is broken, so it
+        # is routed to "deferred" below rather than counted as a real failure.
+        timed_out = False
+        try:
+            result = subprocess.run(
+                [
+                    "claude",
+                    "-p",
+                    prompt,
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--max-budget-usd",
+                    str(max_budget_usd),
+                    "--max-turns",
+                    str(max_turns),
+                    "--disallowedTools",
+                    *DEFAULT_DENY_READS,
+                    "--allowedTools",
+                    *allowed_tools,
+                ],
+                cwd=tree,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=session_timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            # subprocess.run's TimeoutExpired carries whatever output the
+            # session had produced before it was killed -- keep it for the
+            # transcript/ledger instead of discarding it, same forensic value
+            # as a completed run's output.
+            result = subprocess.CompletedProcess(
+                args=["claude"], returncode=1, stdout=exc.stdout or "", stderr=exc.stderr or "",
+            )
 
         TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
         transcript_path = TRANSCRIPTS_DIR / f"{branch.replace('/', '_')}-{_utc_ts()}.jsonl"
@@ -853,6 +879,11 @@ def _dispatch_one(
         # commit+PR discrimination (success vs needs_review).
         if blocker is not None:
             outcome, msg = "blocked", f"paused on cross-repo blocker {blocker}"
+        elif timed_out:
+            outcome, msg = (
+                "deferred",
+                f"deferred (transient): session exceeded {session_timeout_s:.0f}s wall-clock timeout",
+            )
         elif result.returncode != 0 and _is_transient_failure(report.final_message):
             # Not the issue's fault -- a session/rate limit or transport blip. Keep
             # it resumable but don't count it toward the human-escalation cap.
@@ -960,6 +991,16 @@ def main(argv: list[str] | None = None) -> int:
         help="seconds to wait for a pushed PR's CI to go green before promoting "
         "it from draft to ready-for-review; on timeout the PR is left a draft "
         "(default: 600). 0 checks once and does not wait.",
+    )
+    parser.add_argument(
+        "--session-timeout-s",
+        type=float,
+        default=1800.0,
+        help="wall-clock seconds to allow a single headless claude session to "
+        "run before killing it; complements --max-budget-usd/--max-turns, which "
+        "bound spend and turn count but not a stalled/hung session (default: "
+        "1800 = 30 min). A timeout is recorded as 'deferred' (transient, "
+        "resumable) rather than counted as a real failure.",
     )
     args = parser.parse_args(argv)
 
@@ -1129,6 +1170,7 @@ def main(argv: list[str] | None = None) -> int:
                     prior=prior,
                     rtk=args.rtk,
                     ready_timeout=args.ready_timeout,
+                    session_timeout_s=args.session_timeout_s,
                 ): (account, candidate)
                 for account, (candidate, prior) in pairs
             }
