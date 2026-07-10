@@ -19,8 +19,18 @@ a missing capability in another tool's repo the worker files that as an issue
 there and the issue is paused (not failed) until the blocker closes; after
 MAX_ATTEMPTS unresolved tries it's handed to a human.
 
-Each run ends at "PR opened" — never pushes to main, never merges. Defaults to
---dry-run; pass --execute to actually spawn the headless sessions.
+Each run ends at "draft PR opened", promoted to ready-for-review only once its
+checklist body and CI both check out — never pushes to main, never merges.
+Defaults to --dry-run; pass --execute to actually spawn the headless sessions.
+
+Kill switch: `--abort` touches a HALT marker (.fleet-dispatch/HALT) and exits;
+every subsequent --execute run refuses to launch anything until `--clear-halt`
+removes it. See README.md's "Kill switch" section for the one-line runbook.
+
+Every headless session is bounded three ways: --max-budget-usd (spend),
+--max-turns (turn count), and --session-timeout-s (wall-clock time, in case a
+single turn stalls rather than exhausting its turn/budget cap). A timeout is
+recorded as a "deferred" outcome -- resumable, not counted toward MAX_ATTEMPTS.
 """
 
 from __future__ import annotations
@@ -31,11 +41,13 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from mythings.github import github_app_token
 from mythings.isolation import Workspace
 from mythings.ledger import Ledger
 
@@ -48,6 +60,13 @@ WORKSPACE_ROOT = Path(__file__).resolve().parent
 DISPATCH_LEDGER = WORKSPACE_ROOT / ".fleet-dispatch" / "ledger.jsonl"
 ALLOWED_TOOLS_PATH = WORKSPACE_ROOT / ".fleet-dispatch" / "allowed_tools.json"
 TRANSCRIPTS_DIR = WORKSPACE_ROOT / ".fleet-dispatch" / "transcripts"
+# The kill switch: a marker file, not a signal or a flag a running process has
+# to poll mid-loop. `--execute` checks for it before launching anything and
+# refuses outright if it's there, so arming it (`--abort`) always beats a run
+# that starts after it -- no race between "halt" and "launch". It doesn't
+# reach into an already-running headless session (those are already bounded by
+# --max-budget-usd/--max-turns and end on their own); it stops the *next* one.
+HALT_MARKER = WORKSPACE_ROOT / ".fleet-dispatch" / "HALT"
 
 # Guards the read-modify-write of allowed_tools.json and its commit in
 # WORKSPACE_ROOT: concurrent dispatches now run in parallel threads, and two
@@ -69,14 +88,25 @@ DEFAULT_ALLOWED_TOOLS = [
     # Read-only inspection: workers reach for these to look around even though
     # they have native Read/Glob/Grep tools; allowing the non-mutating ones up
     # front stops a run from dead-ending on a denied `ls`/`grep` (see the
-    # SAFE_FAMILY_PATTERNS note in fleet_usage.py). `find`/`rm`/`pip`/`python -c`
-    # are intentionally absent — those can mutate or run code and stay friction.
+    # SAFE_FAMILY_PATTERNS note in fleet_usage.py). `rm`/`pip`/`python -c` are
+    # intentionally absent — those can mutate or run code and stay friction.
+    # `find` also stays off this list even bare/unprefixed: allowedTools is a
+    # command-prefix match, and there is no prefix of `find . -name X -delete`
+    # (or `-exec ...`) that both matches real read-only usage and excludes the
+    # mutating one, so it stays friction like `rm`.
     "Bash(ls*)",
     "Bash(cat*)",
     "Bash(head*)",
     "Bash(tail*)",
     "Bash(wc*)",
     "Bash(grep*)",
+    "Bash(pwd*)",
+    "Bash(printenv*)",
+    "Bash(env)",
+    # Setup a worker routinely needs before it can run a repo's own tests: a
+    # local venv. `pip install` still isn't on this list, so the worker has to
+    # rely on the repo's checked-in dependencies once the venv exists.
+    "Bash(python3 -m venv*)",
     "Bash(gh issue view*)",
     "Bash(gh pr create*)",
     # Filing a blocker issue in another tool's repo when this one can't proceed
@@ -85,9 +115,42 @@ DEFAULT_ALLOWED_TOOLS = [
     "Bash(gh issue create*)",
 ]
 
+# Passed to every worker as `--disallowedTools` so a headless session never
+# burns tokens reading (or wanders into) generated / vendored / provenance dirs
+# that are irrelevant to closing a code issue. This is the real, supported
+# stand-in for a ".claudeignore": Claude Code has no such file, but a Read()
+# deny glob is exactly the "don't read what's useless" lever. The worker is
+# already filesystem-isolated to one repo's worktree (see Workspace below), so
+# these globs only need to hide noise *within* that repo. Deny Edit too: none of
+# these are files a worker should be rewriting to close an issue.
+DEFAULT_DENY_READS = [
+    "Read(**/.venv/**)",
+    "Read(**/__pycache__/**)",
+    "Read(**/*.pyc)",
+    "Read(**/.ruff_cache/**)",
+    "Read(**/.pytest_cache/**)",
+    "Read(**/.git/**)",
+    "Read(**/node_modules/**)",
+    "Read(**/dev-ledger/**)",
+    "Edit(**/.venv/**)",
+    "Edit(**/dev-ledger/**)",
+]
+
 
 def _utc_ts() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _today_spend_usd(ledger: Ledger, *, today: str | None = None) -> float:
+    # UTC calendar day, matching _utc_ts/_utc_now elsewhere in this file — a
+    # daily cap that drifted with the host's local timezone would reset at an
+    # unpredictable wall-clock hour.
+    day = today or datetime.now(UTC).strftime("%Y-%m-%d")
+    return sum(
+        float(e.data.get("cost_usd", 0.0))
+        for e in ledger.read(tool="fleet_dispatch", kind="usage")
+        if e.ts.startswith(day)
+    )
 
 
 def _load_allowed_tools() -> list[str]:
@@ -272,6 +335,19 @@ def _prompt_for(
         "is paused, not failed, until the blocker is resolved.\n\n"
     )
 
+    critical_block = (
+        "If while working you discover a SEPARATE bug that is a security issue "
+        "or breaks a core invariant shared across the fleet (a `my-things-core` "
+        "contract, the build harness, or anything that would let other tools "
+        "ship broken work on top of it), file it immediately with "
+        "`gh issue create --label critical --label bug --repo MyThingsLab/<repo>` "
+        "describing exactly what's broken and its blast radius. That label halts "
+        "new fleet dispatch org-wide until it's closed -- do not wait until you "
+        f"finish this task to file it. Filing it does not abort your own work; "
+        f"keep going on issue #{number} unless the critical bug blocks it "
+        "directly, in which case treat it as a blocker per the paragraph above.\n\n"
+    )
+
     return (
         resume_block
         + f"Work issue #{number} in the {repo} repo (`gh issue view {number} --repo "
@@ -283,12 +359,24 @@ def _prompt_for(
         f"your Read, Edit, Write, Glob and Grep tools over shelling out to `ls`, "
         f"`cat`, `find` or `grep` to inspect the repo.\n\n"
         + blocker_block
+        + critical_block
         + "Follow this repo's own CLAUDE.md and HARNESS.md exactly. Make the smallest "
-        "change that closes the issue, with tests. Run the repo's test suite and "
-        "linter before finishing. Commit your work, then open a pull request with "
-        "`gh pr create` describing the change — do not push to main and do not "
-        "merge the PR yourself. Stay inside this repo; do not touch any other repo "
-        "in the workspace."
+        "change that closes the issue, with tests. Do not read or edit generated / "
+        "vendored / provenance paths — .venv, __pycache__, .ruff_cache, "
+        ".pytest_cache, node_modules, dev-ledger — reads there are blocked and add "
+        "nothing. Stay inside this repo; do not touch any other repo in the "
+        "workspace.\n\n"
+        "Run the repo's full test suite AND its linter, and confirm both pass, "
+        "before you finish. Commit your work, then open the pull request as a DRAFT "
+        "with `gh pr create --draft`. The PR body MUST contain, verbatim, a line "
+        f"`Closes #{number}` and this readiness checklist with every box you have "
+        "actually satisfied checked:\n"
+        "- [ ] pytest passes\n"
+        "- [ ] ruff clean\n"
+        "- [ ] change scoped to this repo only\n"
+        "Leave the PR as a draft — do NOT mark it ready for review, do NOT push to "
+        "main, and do NOT merge it yourself. A separate gate promotes it to ready "
+        "once CI is green."
     )
 
 
@@ -319,6 +407,116 @@ def _open_pr_number(org: str, repo: str, branch: str) -> int | None:
 
 def _branch_name(candidate: Candidate) -> str:
     return f"fleet-dispatch/{candidate.id.replace('#', '-')}"
+
+
+# --- PR merge-readiness gate -----------------------------------------------
+#
+# A pushed draft PR is promoted to "ready for review" only when it honours the
+# checklist contract from _prompt_for AND its CI actually goes green. Everything
+# short of that stays a draft and reports "needs_review" (a resumable outcome),
+# so "success" always means a human can pick the PR up to merge. Never merges --
+# the human always does that.
+
+
+def _pr_body(org: str, repo: str, number: int) -> str:
+    result = subprocess.run(
+        ["gh", "pr", "view", str(number), "--repo", f"{org}/{repo}", "--json", "body", "--jq", ".body"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _pr_body_ok(body: str, issue_number: str) -> tuple[bool, str]:
+    # Enforced-checklist half of readiness: the PR must reference the issue it
+    # closes and carry a checklist with at least one box the worker actually
+    # ticked. A body that skips it means the worker didn't follow the contract.
+    low = body.lower()
+    if f"closes #{issue_number}" not in low:
+        return False, f"body is missing 'Closes #{issue_number}'"
+    if "- [x]" not in low:
+        return False, "body is missing a checked readiness checklist"
+    return True, ""
+
+
+def _checks_state(org: str, repo: str, number: int) -> str:
+    # Collapses gh's per-check buckets into one verdict:
+    #   'none'    -> no CI checks are configured/reported (can't verify green)
+    #   'fail'    -> at least one check failed or was cancelled
+    #   'pending' -> nothing failed yet but something is still running/queued
+    #   'pass'    -> every check settled successfully (or was skipped)
+    result = subprocess.run(
+        ["gh", "pr", "checks", str(number), "--repo", f"{org}/{repo}", "--json", "bucket", "--jq", ".[].bucket"],
+        capture_output=True, text=True,
+    )
+    buckets = [b for b in result.stdout.split() if b]
+    if not buckets:
+        return "none"
+    if any(b in ("fail", "cancel") for b in buckets):
+        return "fail"
+    if any(b == "pending" for b in buckets):
+        return "pending"
+    return "pass"
+
+
+def _critical_halt_issues(org: str) -> list[dict]:
+    # Any open `critical`-labelled issue anywhere in the org is a soft halt:
+    # new dispatch stops fleet-wide until it's closed. See CONVENTIONS.md
+    # "Filing bugs".
+    result = subprocess.run(
+        [
+            "gh", "search", "issues", "--owner", org, "--state", "open",
+            "--label", "critical", "--json", "repository,number,title,url",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+
+
+def _wait_for_checks(
+    org: str, repo: str, number: int, *, timeout: float, interval: float = 15.0
+) -> str:
+    # Polls until CI settles or `timeout` seconds elapse. Returns the terminal
+    # state ('pass'/'fail'/'none'), or 'pending' if it timed out still running.
+    # timeout=0 degenerates to a single check -- the shape unit tests exercise.
+    deadline = time.monotonic() + timeout
+    while True:
+        state = _checks_state(org, repo, number)
+        if state != "pending":
+            return state
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "pending"
+        time.sleep(min(interval, remaining))
+
+
+def _promote_pr(org: str, repo: str, number: int) -> None:
+    subprocess.run(["gh", "pr", "ready", str(number), "--repo", f"{org}/{repo}"], check=True)
+
+
+def _finalize_pr(
+    org: str, repo: str, issue_number: str, pr_number: int, *, ready_timeout: float
+) -> tuple[str, str]:
+    # Maps a freshly-pushed draft PR onto the existing outcome vocabulary so the
+    # resume/recover router still understands it: "success" ONLY when the body
+    # holds AND CI goes green (then it's promoted out of draft); otherwise
+    # "needs_review", which is resumable and leaves the draft for a human.
+    body_ok, why = _pr_body_ok(_pr_body(org, repo, pr_number), issue_number)
+    if not body_ok:
+        return "needs_review", f"PR #{pr_number} left draft (not merge-ready): {why}"
+    state = _wait_for_checks(org, repo, pr_number, timeout=ready_timeout)
+    if state == "pass":
+        _promote_pr(org, repo, pr_number)
+        return "success", f"PR #{pr_number} promoted to ready for review (CI green)"
+    if state == "none":
+        return "needs_review", f"PR #{pr_number} left draft: no CI checks to verify green"
+    if state == "pending":
+        return "needs_review", f"PR #{pr_number} left draft: CI still running after {ready_timeout:.0f}s"
+    return "needs_review", f"PR #{pr_number} left draft: CI failing"
 
 
 # --- resume / recover loop -------------------------------------------------
@@ -547,12 +745,15 @@ def _dispatch_one(
     *,
     execute: bool,
     max_budget_usd: float,
+    max_turns: int,
     ledger: Ledger,
     org: str,
     prior: Attempt | None = None,
     rtk: bool = False,
+    ready_timeout: float = 0.0,
+    session_timeout_s: float = 1800.0,
 ) -> None:
-    repo, _number = candidate.id.split("#")
+    repo, number = candidate.id.split("#")
     repo_path = WORKSPACE_ROOT / repo
     branch = _branch_name(candidate)
     attempt_number = (prior.attempt_number + 1) if prior is not None else 1
@@ -573,7 +774,8 @@ def _dispatch_one(
         f"\n=== {account.name} -> {candidate.id} ({repo}) [{mode}] ===\n"
         f"  branch: {branch} (base {base_ref})\n"
         f"  config: {account.config_dir}\n"
-        f"  budget cap: ${max_budget_usd}\n"
+        f"  budget cap: ${max_budget_usd}, turn cap: {max_turns}, "
+        f"session timeout: {session_timeout_s:.0f}s\n"
         f"  prompt: {prompt}"
     )
 
@@ -615,24 +817,47 @@ def _dispatch_one(
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         env = {**os.environ, "CLAUDE_CONFIG_DIR": str(account.config_dir)}
-        result = subprocess.run(
-            [
-                "claude",
-                "-p",
-                prompt,
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--max-budget-usd",
-                str(max_budget_usd),
-                "--allowedTools",
-                *allowed_tools,
-            ],
-            cwd=tree,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
+        # --max-budget-usd/--max-turns bound the session's spend and turn count,
+        # but neither bounds wall-clock time: a single stalled turn (network
+        # hang, or the exact "no one can approve a denied command" stall the
+        # prompt warns the worker about) would otherwise block this thread
+        # forever with no backstop. `timeout=` is that backstop; a timeout is an
+        # infrastructure hiccup, not evidence the issue itself is broken, so it
+        # is routed to "deferred" below rather than counted as a real failure.
+        timed_out = False
+        try:
+            result = subprocess.run(
+                [
+                    "claude",
+                    "-p",
+                    prompt,
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                    "--max-budget-usd",
+                    str(max_budget_usd),
+                    "--max-turns",
+                    str(max_turns),
+                    "--disallowedTools",
+                    *DEFAULT_DENY_READS,
+                    "--allowedTools",
+                    *allowed_tools,
+                ],
+                cwd=tree,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=session_timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            timed_out = True
+            # subprocess.run's TimeoutExpired carries whatever output the
+            # session had produced before it was killed -- keep it for the
+            # transcript/ledger instead of discarding it, same forensic value
+            # as a completed run's output.
+            result = subprocess.CompletedProcess(
+                args=["claude"], returncode=1, stdout=exc.stdout or "", stderr=exc.stderr or "",
+            )
 
         TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
         transcript_path = TRANSCRIPTS_DIR / f"{branch.replace('/', '_')}-{_utc_ts()}.jsonl"
@@ -688,6 +913,11 @@ def _dispatch_one(
         # commit+PR discrimination (success vs needs_review).
         if blocker is not None:
             outcome, msg = "blocked", f"paused on cross-repo blocker {blocker}"
+        elif timed_out:
+            outcome, msg = (
+                "deferred",
+                f"deferred (transient): session exceeded {session_timeout_s:.0f}s wall-clock timeout",
+            )
         elif result.returncode != 0 and _is_transient_failure(report.final_message):
             # Not the issue's fault -- a session/rate limit or transport blip. Keep
             # it resumable but don't count it toward the human-escalation cap.
@@ -700,7 +930,12 @@ def _dispatch_one(
             outcome, msg = "failed", "commits present but push failed"
         else:
             pr_number = _open_pr_number(org, repo, branch)
-            outcome, msg = _dispatch_outcome(total_commits, pr_number)
+            if pr_number is None:
+                outcome, msg = _dispatch_outcome(total_commits, None)
+            else:
+                outcome, msg = _finalize_pr(
+                    org, repo, number, pr_number, ready_timeout=ready_timeout
+                )
 
         note = (
             f" (worker's last words: {report.final_message[:160]!r})"
@@ -734,11 +969,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--accounts",
-        required=True,
         help="comma-separated CLAUDE_CONFIG_DIR paths, one per available worker "
-        "(each must already be `claude auth login`'d)",
+        "(each must already be `claude auth login`'d). Not required with "
+        "--abort/--clear-halt.",
     )
     parser.add_argument("--execute", action="store_true", help="actually launch headless sessions")
+    halt_group = parser.add_mutually_exclusive_group()
+    halt_group.add_argument(
+        "--abort",
+        action="store_true",
+        help="kill switch: touch the HALT marker and exit immediately (no "
+        "--accounts needed). Every subsequent --execute run refuses to launch "
+        "anything until --clear-halt runs.",
+    )
+    halt_group.add_argument(
+        "--clear-halt",
+        action="store_true",
+        help="remove the HALT marker and exit immediately, restoring normal "
+        "--execute operation.",
+    )
     parser.add_argument(
         "--rtk",
         action="store_true",
@@ -755,11 +1004,107 @@ def main(argv: list[str] | None = None) -> int:
         default=3.0,
         help="dollar cap passed to each headless claude session (default: $3)",
     )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=40,
+        help="turn cap passed to each headless claude session (default: 40)",
+    )
+    parser.add_argument(
+        "--max-daily-usd",
+        type=float,
+        default=20.0,
+        help="hard ceiling on total fleet_dispatch spend (all accounts, kind=usage "
+        "ledger entries) per UTC calendar day; a run that would push projected "
+        "spend over this refuses to launch anything, before spend (default: $20)",
+    )
+    parser.add_argument(
+        "--ready-timeout",
+        type=float,
+        default=600.0,
+        help="seconds to wait for a pushed PR's CI to go green before promoting "
+        "it from draft to ready-for-review; on timeout the PR is left a draft "
+        "(default: 600). 0 checks once and does not wait.",
+    )
+    parser.add_argument(
+        "--session-timeout-s",
+        type=float,
+        default=1800.0,
+        help="wall-clock seconds to allow a single headless claude session to "
+        "run before killing it; complements --max-budget-usd/--max-turns, which "
+        "bound spend and turn count but not a stalled/hung session (default: "
+        "1800 = 30 min). A timeout is recorded as 'deferred' (transient, "
+        "resumable) rather than counted as a real failure.",
+    )
+    parser.add_argument(
+        "--app-id",
+        help="GitHub App ID; combine with --app-installation-id and "
+        "--app-private-key to authenticate as the App instead of the ambient "
+        "gh PAT for every gh call this run makes -- both fleet_dispatch's own "
+        "and each dispatched worker's own gh commands, via GH_TOKEN",
+    )
+    parser.add_argument("--app-installation-id", help="GitHub App installation ID (see --app-id)")
+    parser.add_argument(
+        "--app-private-key", help="path to the GitHub App's private key .pem file (see --app-id)"
+    )
     args = parser.parse_args(argv)
+
+    if args.abort:
+        HALT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        HALT_MARKER.write_text(f"halted at {_utc_ts()}\n")
+        print(
+            f"HALT marker armed at {HALT_MARKER} — every subsequent --execute run "
+            f"refuses to launch until `python3 fleet_dispatch.py --clear-halt` runs"
+        )
+        return 0
+
+    if args.clear_halt:
+        if HALT_MARKER.exists():
+            HALT_MARKER.unlink()
+            print(f"HALT marker cleared: {HALT_MARKER}")
+        else:
+            print("no HALT marker was set")
+        return 0
+
+    if not args.accounts:
+        parser.error("--accounts must list at least one CLAUDE_CONFIG_DIR")
 
     accounts = _parse_accounts(args.accounts)
     if not accounts:
         parser.error("--accounts must list at least one CLAUDE_CONFIG_DIR")
+
+    if HALT_MARKER.exists():
+        if args.execute:
+            print(
+                f"refusing to launch: HALT marker present at {HALT_MARKER} (fleet "
+                f"kill switch armed). Run `python3 fleet_dispatch.py --clear-halt` "
+                f"once it's safe to resume."
+            )
+            return 1
+        print(
+            f"note: HALT marker present at {HALT_MARKER} — this dry run still "
+            f"reports normally, but --execute would refuse until --clear-halt"
+        )
+
+    app_flags = [args.app_id, args.app_installation_id, args.app_private_key]
+    if any(app_flags) and not all(app_flags):
+        parser.error(
+            "--app-id, --app-installation-id, and --app-private-key must be given together"
+        )
+    if all(app_flags):
+        # Setting it here, once, is enough for every later `gh` call in this
+        # process: fleet_dispatch's own bare subprocess.run(["gh", ...]) calls
+        # inherit os.environ implicitly, and _dispatch_one's `env = {**os.environ,
+        # ...}` for each spawned worker copies it too -- one mint covers both,
+        # no Runner-threading needed. Installation tokens last ~1h, comfortably
+        # longer than a single fleet_dispatch.py invocation.
+        os.environ["GH_TOKEN"] = github_app_token(
+            args.app_id, args.app_installation_id, args.app_private_key
+        )
+        print(
+            f"authenticating as the GitHub App (installation {args.app_installation_id}) "
+            f"— the personal PAT is not used for this run"
+        )
 
     # A fleet of accounts that are secretly the same account is not a fleet.
     # Always gate on distinct identities -- cheap, local, and it prevents silently
@@ -779,6 +1124,26 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  - {p}")
             return 1
         print("rtk output-compression hook verified for every account")
+
+    # Soft halt: a `critical`-labelled issue open anywhere in the org means
+    # something security-relevant or fleet-wide-invariant-breaking is
+    # unresolved. Stop starting new work until it's closed -- in-flight
+    # workers still finish normally. See CONVENTIONS.md "Filing bugs".
+    critical_issues = _critical_halt_issues(args.org)
+    if critical_issues:
+        dispatch_ledger = Ledger(DISPATCH_LEDGER)
+        refs = [f"{i['repository']['nameWithOwner']}#{i['number']}" for i in critical_issues]
+        print("halted: critical issue(s) open, not dispatching new work:")
+        for i, ref in zip(critical_issues, refs):
+            print(f"  - {ref}: {i['title']} ({i['url']})")
+        dispatch_ledger.record(
+            tool="fleet_dispatch",
+            kind="dispatch",
+            outcome="halted_critical",
+            detail=f"{len(refs)} critical issue(s) open: {', '.join(refs)}",
+            issues=refs,
+        )
+        return 0
 
     orch = Orchestrator(
         org=args.org,
@@ -851,6 +1216,25 @@ def main(argv: list[str] | None = None) -> int:
         plan.append((c, prior if decision == "resume" else None))
 
     pairs = list(zip(accounts, plan))
+
+    # Enforced before spend, not after: sum today's actual usage-ledger cost
+    # plus the worst case for every session this run is about to launch, and
+    # refuse the whole run if that would cross the daily ceiling. A dry run
+    # spends nothing, so it's exempt.
+    if args.execute and pairs:
+        spent_today = _today_spend_usd(dispatch_ledger)
+        projected = spent_today + len(pairs) * args.max_budget_usd
+        if projected > args.max_daily_usd:
+            print(
+                f"refusing to launch: today's fleet_dispatch spend is already "
+                f"${spent_today:.2f}, and {len(pairs)} more session(s) at up to "
+                f"${args.max_budget_usd:.2f} each could reach ${projected:.2f}, "
+                f"over the ${args.max_daily_usd:.2f}/day cap (--max-daily-usd). "
+                f"Raise --max-daily-usd, lower --max-budget-usd, or wait for the "
+                f"UTC day to roll over."
+            )
+            return 1
+
     failures: list[tuple[Account, Candidate, BaseException]] = []
     if pairs:
         # One worker thread per account: each already runs in its own git
@@ -865,10 +1249,13 @@ def main(argv: list[str] | None = None) -> int:
                     candidate,
                     execute=args.execute,
                     max_budget_usd=args.max_budget_usd,
+                    max_turns=args.max_turns,
                     ledger=dispatch_ledger,
                     org=args.org,
                     prior=prior,
                     rtk=args.rtk,
+                    ready_timeout=args.ready_timeout,
+                    session_timeout_s=args.session_timeout_s,
                 ): (account, candidate)
                 for account, (candidate, prior) in pairs
             }

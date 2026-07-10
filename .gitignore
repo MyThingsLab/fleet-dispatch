@@ -1,19 +1,36 @@
-# Each of these is its own independent git repo (its own remote, history,
-# CI) -- ignored here rather than embedded, so this repo only tracks the
-# workspace-level tooling that lives loose at the root.
-my-changelogger/
-my-guard/
-my-orchestrator/
-my-reporter/
-my-telegram-bot/
-my-template/
-my-tester/
-mythings-core/
+# Each of these is a symlink into the sibling checkout at ../my-<x> (its own
+# independent git repo -- own remote, history, CI) -- ignored here rather
+# than embedded, so this repo only tracks the workspace-level tooling that
+# lives loose at the root. No trailing slash: a trailing "/" only matches a
+# real directory, not a symlink-to-directory, so these leaked into `git
+# status` as untracked until this was caught.
+my-changelogger
+my-guard
+my-orchestrator
+my-reporter
+my-telegram-bot
+my-template
+my-tester
+mythings-core
+my-planner
+my-projector
+my-researcher
+my-searcher
+my-server
+my-todo
+my-uni
+study
+.github
 
 .venv/
 .ruff_cache/
 __pycache__/
 *.py[cod]
+
+# Local runtime ledger from ad-hoc CLI runs against the workspace root
+# (e.g. myplanner/mytodo default --ledger path) -- not part of fleet-dispatch's
+# own dispatch ledger (.fleet-dispatch/ledger.jsonl), which is tracked.
+.mythings/
 
 # Claude Code's local session state for this workspace -- not part of the
 # fleet-dispatch tooling this repo tracks.
@@ -24,3 +41,8 @@ __pycache__/
 # exists. The ledger keeps a pointer to each transcript's path regardless.
 .fleet-dispatch/transcripts/
 .fleet-dispatch/backups/
+
+# The kill-switch marker: a local operational flag (--abort/--clear-halt),
+# not fleet state worth a commit. Committing it would "halt" the fleet for
+# everyone who pulls that commit and need a revert to undo.
+.fleet-dispatch/HALT

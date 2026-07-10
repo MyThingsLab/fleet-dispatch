@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
-from mythings.ledger import Ledger
+from mythings.ledger import Ledger, LedgerEntry
 
 import fleet_dispatch as fd
 from fleet_usage import UsageReport, family_for
@@ -178,7 +180,7 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
     calls_lock = threading.Lock()
 
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0, session_timeout_s=1800.0
     ):
         start = time.monotonic()
         time.sleep(0.2)
@@ -225,7 +227,7 @@ def test_main_surfaces_every_account_failure_not_just_first(
     # dropping any other account's crash. Both accounts fail here on purpose;
     # both should still be reported.
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0, session_timeout_s=1800.0
     ):
         raise RuntimeError(f"boom-{account.name}")
 
@@ -260,13 +262,61 @@ def test_main_surfaces_every_account_failure_not_just_first(
     assert "boom-account2" in out
 
 
+def test_critical_halt_issues_parses_gh_search_output(monkeypatch) -> None:
+    payload = [
+        {"repository": {"nameWithOwner": "MyThingsLab/my-things-core"}, "number": 5,
+         "title": "auth bypass", "url": "https://github.com/MyThingsLab/my-things-core/issues/5"},
+    ]
+
+    def fake_run(cmd, **kwargs):
+        assert cmd[:3] == ["gh", "search", "issues"]
+        assert "critical" in cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+    assert fd._critical_halt_issues("MyThingsLab") == payload
+
+
+def test_critical_halt_issues_empty_on_gh_failure(monkeypatch) -> None:
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not authenticated")
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+    assert fd._critical_halt_issues("MyThingsLab") == []
+
+
+def test_main_halts_dispatch_when_critical_issue_open(tmp_path: Path, monkeypatch, capsys) -> None:
+    critical = [
+        {"repository": {"nameWithOwner": "MyThingsLab/my-things-core"}, "number": 5,
+         "title": "auth bypass", "url": "https://github.com/MyThingsLab/my-things-core/issues/5"},
+    ]
+    monkeypatch.setattr(fd, "_critical_halt_issues", lambda org: critical)
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+
+    def boom_orchestrator(**_kwargs):
+        raise AssertionError("Orchestrator should not be constructed while halted")
+
+    monkeypatch.setattr(fd, "Orchestrator", boom_orchestrator)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a")])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "halted" in out
+    assert "my-things-core#5" in out
+
+    entries = list(Ledger(fd.DISPATCH_LEDGER))
+    assert entries[-1].outcome == "halted_critical"
+
+
 def test_main_skips_issue_with_open_pr_in_flight(tmp_path: Path, monkeypatch) -> None:
     # An issue that already has an open fleet-dispatch PR must not be handed to
     # an account again -- otherwise a second, duplicate PR gets opened for it.
     dispatched: list[str] = []
 
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0, session_timeout_s=1800.0
     ):
         dispatched.append(candidate.id)
 
@@ -532,7 +582,7 @@ def test_main_resumes_or_skips_by_prior_attempt(tmp_path: Path, monkeypatch) -> 
     got: dict[str, object] = {}
 
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, ledger, org, prior=None, rtk=False
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0, session_timeout_s=1800.0
     ):
         got[candidate.id] = prior
 
@@ -579,3 +629,512 @@ def test_main_resumes_or_skips_by_prior_attempt(tmp_path: Path, monkeypatch) -> 
     # r#3 hitting the cap is recorded as needs_human so it stays skipped.
     outcomes = [e.outcome for e in Ledger(tmp_path / "ledger.jsonl") if e.data.get("candidate") == "r#3"]
     assert "needs_human" in outcomes
+
+
+# --- deny-reads shrink what a worker may read ------------------------------
+
+
+def test_default_deny_reads_cover_noise_dirs_not_source() -> None:
+    joined = " ".join(fd.DEFAULT_DENY_READS)
+    assert "Read(**/.venv/**)" in fd.DEFAULT_DENY_READS
+    assert "Read(**/__pycache__/**)" in fd.DEFAULT_DENY_READS
+    assert "Read(**/dev-ledger/**)" in fd.DEFAULT_DENY_READS
+    # Source and tests must never be denied -- the worker needs to read them.
+    assert "src" not in joined
+    assert "tests" not in joined
+
+
+def test_prompt_requires_draft_pr_and_checklist() -> None:
+    candidate = fd.Candidate(
+        id="myrepo#7", repo="myrepo", tool="", title="t", kind="issue", created_at=""
+    )
+    prompt = fd._prompt_for(candidate)
+    assert "--draft" in prompt
+    assert "Closes #7" in prompt
+    assert "do NOT mark it ready" in prompt
+
+
+# --- PR merge-readiness: draft promoted only on checklist + green CI --------
+
+
+def test_pr_body_ok_requires_closes_and_checked_box() -> None:
+    ok, _ = fd._pr_body_ok("Closes #7\n- [x] pytest passes", "7")
+    assert ok is True
+
+
+def test_pr_body_ok_rejects_missing_closes() -> None:
+    ok, why = fd._pr_body_ok("- [x] pytest passes", "7")
+    assert ok is False
+    assert "Closes #7" in why
+
+
+def test_pr_body_ok_rejects_unchecked_checklist() -> None:
+    ok, why = fd._pr_body_ok("Closes #7\n- [ ] pytest passes", "7")
+    assert ok is False
+    assert "checklist" in why
+
+
+@pytest.mark.parametrize(
+    ("buckets", "expected"),
+    [
+        ("", "none"),
+        ("pass\npass", "pass"),
+        ("pass\nskipping", "pass"),
+        ("pass\npending", "pending"),
+        ("pass\nfail", "fail"),
+        ("cancel", "fail"),
+    ],
+)
+def test_checks_state_collapses_buckets(monkeypatch, buckets: str, expected: str) -> None:
+    monkeypatch.setattr(
+        fd.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=buckets, stderr=""),
+    )
+    assert fd._checks_state("org", "repo", 1) == expected
+
+
+def test_wait_for_checks_returns_pending_on_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(fd, "_checks_state", lambda *a, **k: "pending")
+    # timeout=0 -> a single check, no sleeping; still-running stays 'pending'.
+    assert fd._wait_for_checks("org", "repo", 1, timeout=0) == "pending"
+
+
+def test_finalize_pr_promotes_and_succeeds_when_body_ok_and_ci_green(monkeypatch) -> None:
+    promoted: list[int] = []
+    monkeypatch.setattr(fd, "_pr_body", lambda *a, **k: "Closes #7\n- [x] pytest passes")
+    monkeypatch.setattr(fd, "_wait_for_checks", lambda *a, **k: "pass")
+    monkeypatch.setattr(fd, "_promote_pr", lambda org, repo, n: promoted.append(n))
+
+    outcome, _ = fd._finalize_pr("org", "repo", "7", 42, ready_timeout=0)
+
+    # Success -- the only path that maps to a mergeable, promoted PR.
+    assert outcome == "success"
+    assert promoted == [42]
+
+
+def test_finalize_pr_needs_review_and_stays_draft_when_ci_fails(monkeypatch) -> None:
+    promoted: list[int] = []
+    monkeypatch.setattr(fd, "_pr_body", lambda *a, **k: "Closes #7\n- [x] pytest passes")
+    monkeypatch.setattr(fd, "_wait_for_checks", lambda *a, **k: "fail")
+    monkeypatch.setattr(fd, "_promote_pr", lambda org, repo, n: promoted.append(n))
+
+    outcome, msg = fd._finalize_pr("org", "repo", "7", 42, ready_timeout=0)
+
+    assert outcome == "needs_review"
+    assert "CI failing" in msg
+    assert promoted == []
+
+
+def test_finalize_pr_needs_review_when_body_incomplete(monkeypatch) -> None:
+    promoted: list[int] = []
+    monkeypatch.setattr(fd, "_pr_body", lambda *a, **k: "no closes line here")
+    monkeypatch.setattr(fd, "_wait_for_checks", lambda *a, **k: "pass")
+    monkeypatch.setattr(fd, "_promote_pr", lambda org, repo, n: promoted.append(n))
+
+    outcome, _ = fd._finalize_pr("org", "repo", "7", 42, ready_timeout=0)
+
+    assert outcome == "needs_review"
+    assert promoted == []  # a green CI never promotes a PR whose body is incomplete
+
+
+def test_finalize_pr_needs_review_when_no_ci_checks(monkeypatch) -> None:
+    monkeypatch.setattr(fd, "_pr_body", lambda *a, **k: "Closes #7\n- [x] pytest passes")
+    monkeypatch.setattr(fd, "_wait_for_checks", lambda *a, **k: "none")
+
+    outcome, _ = fd._finalize_pr("org", "repo", "7", 42, ready_timeout=0)
+
+    assert outcome == "needs_review"
+
+
+def test_abort_arms_halt_marker_without_needing_accounts(tmp_path: Path, monkeypatch) -> None:
+    marker = tmp_path / "HALT"
+    monkeypatch.setattr(fd, "HALT_MARKER", marker)
+
+    rc = fd.main(["--abort"])
+
+    assert rc == 0
+    assert marker.exists()
+
+
+def test_clear_halt_removes_marker(tmp_path: Path, monkeypatch) -> None:
+    marker = tmp_path / "HALT"
+    marker.write_text("halted at some point\n")
+    monkeypatch.setattr(fd, "HALT_MARKER", marker)
+
+    rc = fd.main(["--clear-halt"])
+
+    assert rc == 0
+    assert not marker.exists()
+
+
+def test_clear_halt_when_not_set_is_a_noop(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(fd, "HALT_MARKER", tmp_path / "HALT")
+
+    rc = fd.main(["--clear-halt"])
+
+    assert rc == 0
+
+
+def test_abort_and_clear_halt_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        fd.main(["--abort", "--clear-halt"])
+
+
+def _dispatch_stub(calls: list) -> callable:
+    def fake_dispatch_one(*a, **k):
+        calls.append(k)
+
+    return fake_dispatch_one
+
+
+def _wire_single_candidate_orchestrator(monkeypatch) -> None:
+    candidates = [
+        fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
+
+
+def test_main_refuses_execute_when_halted(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(fd, "HALT_MARKER", tmp_path / "HALT")
+    (tmp_path / "HALT").write_text("halted\n")
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    calls: list = []
+    monkeypatch.setattr(fd, "_dispatch_one", _dispatch_stub(calls))
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a"), "--execute"])
+
+    assert rc == 1
+    assert calls == [], "the kill switch must stop launch before any session starts"
+
+
+def test_main_dry_run_still_reports_when_halted(tmp_path: Path, monkeypatch, capsys) -> None:
+    # A dry run spends nothing, so the marker is informational there, not a
+    # block -- symmetric with how --max-daily-usd treats dry runs.
+    monkeypatch.setattr(fd, "HALT_MARKER", tmp_path / "HALT")
+    (tmp_path / "HALT").write_text("halted\n")
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    calls: list = []
+    monkeypatch.setattr(fd, "_dispatch_one", _dispatch_stub(calls))
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a")])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "HALT marker present" in out
+    assert len(calls) == 1  # dry-run _dispatch_one still runs; it just prints and returns
+
+
+def _usage_entry(ledger: Ledger, *, cost_usd: float, ts: str) -> None:
+    ledger.append(
+        LedgerEntry(tool="fleet_dispatch", kind="usage", outcome="success", ts=ts, data={"cost_usd": cost_usd})
+    )
+
+
+def test_today_spend_usd_sums_only_todays_usage_entries(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    _usage_entry(ledger, cost_usd=1.5, ts="2026-07-10T01:00:00Z")
+    _usage_entry(ledger, cost_usd=2.25, ts="2026-07-10T02:00:00Z")
+    _usage_entry(ledger, cost_usd=99.0, ts="2026-07-09T23:59:59Z")  # yesterday, excluded
+
+    assert fd._today_spend_usd(ledger, today="2026-07-10") == pytest.approx(3.75)
+
+
+def test_today_spend_usd_ignores_non_usage_entries(tmp_path: Path) -> None:
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    ledger.record(tool="fleet_dispatch", kind="dispatch", outcome="success", cost_usd=50.0)
+
+    assert fd._today_spend_usd(ledger, today="2026-07-10") == 0.0
+
+
+def test_main_refuses_to_dispatch_over_daily_cap(tmp_path: Path, monkeypatch) -> None:
+    dispatch_ledger_path = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", dispatch_ledger_path)
+    ledger = Ledger(dispatch_ledger_path)
+    today = datetime.now(fd.UTC).strftime("%Y-%m-%d")
+    _usage_entry(ledger, cost_usd=19.0, ts=f"{today}T00:00:00Z")
+
+    called = False
+
+    def fake_dispatch_one(*a, **k):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
+
+    candidates = [
+        fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+
+    rc = fd.main(
+        [
+            "--accounts", str(tmp_path / "a"),
+            "--execute",
+            "--max-budget-usd", "3.0",
+            "--max-daily-usd", "20.0",
+        ]
+    )
+
+    assert rc == 1
+    assert called is False, "must refuse before spend, not launch and hope"
+
+
+def test_main_dry_run_ignores_daily_cap(tmp_path: Path, monkeypatch) -> None:
+    # A dry run spends nothing, so it must not be blocked by the cap -- the
+    # whole point of --dry-run is to report safely regardless of budget state.
+    dispatch_ledger_path = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", dispatch_ledger_path)
+    ledger = Ledger(dispatch_ledger_path)
+    today = datetime.now(fd.UTC).strftime("%Y-%m-%d")
+    _usage_entry(ledger, cost_usd=999.0, ts=f"{today}T00:00:00Z")
+
+    def fake_dispatch_one(*a, **k):
+        pass
+
+    monkeypatch.setattr(fd, "_dispatch_one", fake_dispatch_one)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
+
+    candidates = [
+        fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a")])
+
+    assert rc == 0
+
+
+def test_dispatch_one_passes_max_turns_and_max_budget_to_claude(tmp_path: Path, monkeypatch) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    _init_git_repo(repo_path)
+    subprocess.run(["git", "-C", str(repo_path), "branch", "-M", "main"], check=True)
+
+    monkeypatch.setattr(fd, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(fd, "TRANSCRIPTS_DIR", tmp_path / "transcripts")
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+
+    captured: dict = {}
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    candidate = fd.Candidate(
+        id="repo#1", repo="repo", tool="", title="t", kind="issue", created_at="2020-01-01"
+    )
+    account = _account(tmp_path / "cfg", {"model": "sonnet"})
+
+    fd._dispatch_one(
+        account,
+        candidate,
+        execute=True,
+        max_budget_usd=1.5,
+        max_turns=7,
+        ledger=Ledger(tmp_path / "ledger.jsonl"),
+        org="MyThingsLab",
+    )
+
+    argv = captured["argv"]
+    assert argv[argv.index("--max-turns") + 1] == "7"
+    assert argv[argv.index("--max-budget-usd") + 1] == "1.5"
+
+
+def test_main_requires_all_three_app_flags_together(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit):
+        fd.main(["--accounts", str(tmp_path / "a"), "--app-id", "4260739"])
+
+
+def test_main_mints_app_token_and_sets_gh_token_env(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+
+    minted = []
+
+    def fake_token(app_id, installation_id, private_key_path):
+        minted.append((app_id, installation_id, private_key_path))
+        return "ghs_minted_token"
+
+    monkeypatch.setattr(fd, "github_app_token", fake_token)
+    monkeypatch.setattr(fd, "_dispatch_one", lambda *a, **k: None)
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    rc = fd.main(
+        [
+            "--accounts", str(tmp_path / "a"),
+            "--app-id", "4260739",
+            "--app-installation-id", "145558758",
+            "--app-private-key", "/path/to/key.pem",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert minted == [("4260739", "145558758", "/path/to/key.pem")]
+    assert os.environ["GH_TOKEN"] == "ghs_minted_token"
+    assert "authenticating as the GitHub App" in out
+
+
+def test_main_without_app_flags_does_not_touch_gh_token_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    monkeypatch.setattr(fd, "_dispatch_one", lambda *a, **k: None)
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    fd.main(["--accounts", str(tmp_path / "a")])
+
+    assert "GH_TOKEN" not in os.environ
+
+
+def _setup_dispatch_one_repo(tmp_path: Path, monkeypatch) -> tuple[fd.Candidate, fd.Account, Ledger]:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    _init_git_repo(repo_path)
+    subprocess.run(["git", "-C", str(repo_path), "branch", "-M", "main"], check=True)
+
+    monkeypatch.setattr(fd, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(fd, "TRANSCRIPTS_DIR", tmp_path / "transcripts")
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+
+    candidate = fd.Candidate(
+        id="repo#1", repo="repo", tool="", title="t", kind="issue", created_at="2020-01-01"
+    )
+    account = _account(tmp_path / "cfg", {"model": "sonnet"})
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    return candidate, account, ledger
+
+
+def test_dispatch_one_worker_env_inherits_gh_token_from_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The whole point of setting os.environ["GH_TOKEN"] once in main(): the
+    # spawned worker's `env = {**os.environ, ...}` picks it up with no
+    # separate wiring. Prove that inheritance directly against _dispatch_one.
+    monkeypatch.setenv("GH_TOKEN", "ghs_from_app")
+    candidate, account, ledger = _setup_dispatch_one_repo(tmp_path, monkeypatch)
+
+    captured: dict = {}
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    fd._dispatch_one(
+        account, candidate, execute=True, max_budget_usd=1.5, max_turns=7,
+        ledger=ledger, org="MyThingsLab",
+    )
+
+    assert captured["kwargs"]["env"]["GH_TOKEN"] == "ghs_from_app"
+
+
+def test_dispatch_one_passes_session_timeout_to_claude(tmp_path: Path, monkeypatch) -> None:
+    candidate, account, ledger = _setup_dispatch_one_repo(tmp_path, monkeypatch)
+
+    captured: dict = {}
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    fd._dispatch_one(
+        account, candidate, execute=True, max_budget_usd=1.5, max_turns=7,
+        ledger=ledger, org="MyThingsLab", session_timeout_s=42.0,
+    )
+
+    assert captured["kwargs"]["timeout"] == 42.0
+
+
+def test_dispatch_one_records_deferred_on_session_timeout(tmp_path: Path, monkeypatch) -> None:
+    # Regression test: --max-budget-usd/--max-turns bound spend and turn count
+    # but not wall-clock time, so a stalled session used to hang its worker
+    # thread forever with no backstop. A subprocess.TimeoutExpired must be
+    # caught and routed to the existing 'deferred' (transient, resumable, not
+    # counted toward MAX_ATTEMPTS) outcome -- not left to propagate and crash
+    # the dispatch, and not miscounted as a real 'failed' attempt.
+    candidate, account, ledger = _setup_dispatch_one_repo(tmp_path, monkeypatch)
+
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 0))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    fd._dispatch_one(
+        account, candidate, execute=True, max_budget_usd=1.5, max_turns=7,
+        ledger=ledger, org="MyThingsLab", session_timeout_s=42.0,
+    )
+
+    entries = [e for e in ledger if e.kind == "dispatch" and e.outcome != "started"]
+    assert len(entries) == 1
+    assert entries[0].outcome == "deferred"
+    assert "42s" in entries[0].detail
+    assert "timeout" in entries[0].detail.lower()
