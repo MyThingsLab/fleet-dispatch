@@ -37,6 +37,11 @@ class AccountUsage:
     session_resets: str
     week_pct: int
     week_resets: str
+    # Set when the probe itself failed (network blip, stale auth, timeout)
+    # rather than returning a real reading. session_pct is forced to 100 in
+    # that case so the account still sorts into "over" (unusable this cycle)
+    # without a caller needing to check this field separately.
+    error: str = ""
 
     @property
     def over(self) -> bool:
@@ -93,9 +98,28 @@ def check_all(config_dirs: list[str]) -> list[AccountUsage]:
 
 
 def select_accounts(config_dirs: list[str], max_session_pct: int = 90) -> tuple[list[AccountUsage], list[AccountUsage]]:
-    """Split accounts into (usable, over-threshold), preserving input order."""
+    """Split accounts into (usable, over-threshold), preserving input order.
+
+    A single account's probe failing (network blip, stale auth, a hung
+    `claude -p "/usage"` call) must not take out the whole batch -- callers
+    like run_fleet_cycle.sh depend on this function degrading gracefully
+    (excluding just the unreachable account) rather than raising, the same
+    way fleet_dispatch.py's own per-account dispatch loop never lets one
+    account's crash stop it from collecting every other account's outcome.
+    """
     usable, over = [], []
-    for usage in check_all(config_dirs):
+    for config_dir in config_dirs:
+        try:
+            usage = check_account(config_dir)
+        except UsageCheckError as exc:
+            usage = AccountUsage(
+                config_dir=os.path.expanduser(config_dir),
+                session_pct=100,
+                session_resets="",
+                week_pct=-1,
+                week_resets="",
+                error=str(exc),
+            )
         (over if usage.session_pct >= max_session_pct else usable).append(usage)
     return usable, over
 
@@ -114,6 +138,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.quiet:
         for u in usable + over:
+            if u.error:
+                print(f"[ERROR] {u.config_dir}: probe failed: {u.error}")
+                continue
             flag = "OVER" if u.session_pct >= args.max_session_pct else "ok"
             print(
                 f"[{flag}] {u.config_dir}: session {u.session_pct}% (resets {u.session_resets}), "

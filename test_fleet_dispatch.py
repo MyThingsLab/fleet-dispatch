@@ -180,7 +180,7 @@ def test_main_dispatches_accounts_concurrently(tmp_path: Path, monkeypatch) -> N
     calls_lock = threading.Lock()
 
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0, session_timeout_s=1800.0
     ):
         start = time.monotonic()
         time.sleep(0.2)
@@ -227,7 +227,7 @@ def test_main_surfaces_every_account_failure_not_just_first(
     # dropping any other account's crash. Both accounts fail here on purpose;
     # both should still be reported.
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0, session_timeout_s=1800.0
     ):
         raise RuntimeError(f"boom-{account.name}")
 
@@ -268,7 +268,7 @@ def test_main_skips_issue_with_open_pr_in_flight(tmp_path: Path, monkeypatch) ->
     dispatched: list[str] = []
 
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0, session_timeout_s=1800.0
     ):
         dispatched.append(candidate.id)
 
@@ -534,7 +534,7 @@ def test_main_resumes_or_skips_by_prior_attempt(tmp_path: Path, monkeypatch) -> 
     got: dict[str, object] = {}
 
     def fake_dispatch_one(
-        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0
+        account, candidate, *, execute, max_budget_usd, max_turns, ledger, org, prior=None, rtk=False, ready_timeout=0.0, session_timeout_s=1800.0
     ):
         got[candidate.id] = prior
 
@@ -994,14 +994,7 @@ def test_main_without_app_flags_does_not_touch_gh_token_env(
     assert "GH_TOKEN" not in os.environ
 
 
-def test_dispatch_one_worker_env_inherits_gh_token_from_process(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # The whole point of setting os.environ["GH_TOKEN"] once in main(): the
-    # spawned worker's `env = {**os.environ, ...}` picks it up with no
-    # separate wiring. Prove that inheritance directly against _dispatch_one.
-    monkeypatch.setenv("GH_TOKEN", "ghs_from_app")
-
+def _setup_dispatch_one_repo(tmp_path: Path, monkeypatch) -> tuple[fd.Candidate, fd.Account, Ledger]:
     repo_path = tmp_path / "repo"
     repo_path.mkdir()
     _init_git_repo(repo_path)
@@ -1011,30 +1004,89 @@ def test_dispatch_one_worker_env_inherits_gh_token_from_process(
     monkeypatch.setattr(fd, "TRANSCRIPTS_DIR", tmp_path / "transcripts")
     monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
 
+    candidate = fd.Candidate(
+        id="repo#1", repo="repo", tool="", title="t", kind="issue", created_at="2020-01-01"
+    )
+    account = _account(tmp_path / "cfg", {"model": "sonnet"})
+    ledger = Ledger(tmp_path / "ledger.jsonl")
+    return candidate, account, ledger
+
+
+def test_dispatch_one_worker_env_inherits_gh_token_from_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The whole point of setting os.environ["GH_TOKEN"] once in main(): the
+    # spawned worker's `env = {**os.environ, ...}` picks it up with no
+    # separate wiring. Prove that inheritance directly against _dispatch_one.
+    monkeypatch.setenv("GH_TOKEN", "ghs_from_app")
+    candidate, account, ledger = _setup_dispatch_one_repo(tmp_path, monkeypatch)
+
     captured: dict = {}
     real_run = fd.subprocess.run
 
     def fake_run(argv, *args, **kwargs):
         if argv and argv[0] == "claude":
-            captured["env"] = kwargs.get("env", {})
+            captured["kwargs"] = kwargs
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         return real_run(argv, *args, **kwargs)
 
     monkeypatch.setattr(fd.subprocess, "run", fake_run)
 
-    candidate = fd.Candidate(
-        id="repo#1", repo="repo", tool="", title="t", kind="issue", created_at="2020-01-01"
+    fd._dispatch_one(
+        account, candidate, execute=True, max_budget_usd=1.5, max_turns=7,
+        ledger=ledger, org="MyThingsLab",
     )
-    account = _account(tmp_path / "cfg", {"model": "sonnet"})
+
+    assert captured["kwargs"]["env"]["GH_TOKEN"] == "ghs_from_app"
+
+
+def test_dispatch_one_passes_session_timeout_to_claude(tmp_path: Path, monkeypatch) -> None:
+    candidate, account, ledger = _setup_dispatch_one_repo(tmp_path, monkeypatch)
+
+    captured: dict = {}
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
 
     fd._dispatch_one(
-        account,
-        candidate,
-        execute=True,
-        max_budget_usd=1.5,
-        max_turns=7,
-        ledger=Ledger(tmp_path / "ledger.jsonl"),
-        org="MyThingsLab",
+        account, candidate, execute=True, max_budget_usd=1.5, max_turns=7,
+        ledger=ledger, org="MyThingsLab", session_timeout_s=42.0,
     )
 
-    assert captured["env"]["GH_TOKEN"] == "ghs_from_app"
+    assert captured["kwargs"]["timeout"] == 42.0
+
+
+def test_dispatch_one_records_deferred_on_session_timeout(tmp_path: Path, monkeypatch) -> None:
+    # Regression test: --max-budget-usd/--max-turns bound spend and turn count
+    # but not wall-clock time, so a stalled session used to hang its worker
+    # thread forever with no backstop. A subprocess.TimeoutExpired must be
+    # caught and routed to the existing 'deferred' (transient, resumable, not
+    # counted toward MAX_ATTEMPTS) outcome -- not left to propagate and crash
+    # the dispatch, and not miscounted as a real 'failed' attempt.
+    candidate, account, ledger = _setup_dispatch_one_repo(tmp_path, monkeypatch)
+
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout", 0))
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    fd._dispatch_one(
+        account, candidate, execute=True, max_budget_usd=1.5, max_turns=7,
+        ledger=ledger, org="MyThingsLab", session_timeout_s=42.0,
+    )
+
+    entries = [e for e in ledger if e.kind == "dispatch" and e.outcome != "started"]
+    assert len(entries) == 1
+    assert entries[0].outcome == "deferred"
+    assert "42s" in entries[0].detail
+    assert "timeout" in entries[0].detail.lower()
