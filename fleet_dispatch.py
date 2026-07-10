@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from mythings.github import github_app_token
 from mythings.isolation import Workspace
 from mythings.ledger import Ledger
 
@@ -961,6 +962,17 @@ def main(argv: list[str] | None = None) -> int:
         "it from draft to ready-for-review; on timeout the PR is left a draft "
         "(default: 600). 0 checks once and does not wait.",
     )
+    parser.add_argument(
+        "--app-id",
+        help="GitHub App ID; combine with --app-installation-id and "
+        "--app-private-key to authenticate as the App instead of the ambient "
+        "gh PAT for every gh call this run makes -- both fleet_dispatch's own "
+        "and each dispatched worker's own gh commands, via GH_TOKEN",
+    )
+    parser.add_argument("--app-installation-id", help="GitHub App installation ID (see --app-id)")
+    parser.add_argument(
+        "--app-private-key", help="path to the GitHub App's private key .pem file (see --app-id)"
+    )
     args = parser.parse_args(argv)
 
     if args.abort:
@@ -998,6 +1010,26 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"note: HALT marker present at {HALT_MARKER} — this dry run still "
             f"reports normally, but --execute would refuse until --clear-halt"
+        )
+
+    app_flags = [args.app_id, args.app_installation_id, args.app_private_key]
+    if any(app_flags) and not all(app_flags):
+        parser.error(
+            "--app-id, --app-installation-id, and --app-private-key must be given together"
+        )
+    if all(app_flags):
+        # Setting it here, once, is enough for every later `gh` call in this
+        # process: fleet_dispatch's own bare subprocess.run(["gh", ...]) calls
+        # inherit os.environ implicitly, and _dispatch_one's `env = {**os.environ,
+        # ...}` for each spawned worker copies it too -- one mint covers both,
+        # no Runner-threading needed. Installation tokens last ~1h, comfortably
+        # longer than a single fleet_dispatch.py invocation.
+        os.environ["GH_TOKEN"] = github_app_token(
+            args.app_id, args.app_installation_id, args.app_private_key
+        )
+        print(
+            f"authenticating as the GitHub App (installation {args.app_installation_id}) "
+            f"— the personal PAT is not used for this run"
         )
 
     # A fleet of accounts that are secretly the same account is not a fleet.

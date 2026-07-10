@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -941,3 +942,99 @@ def test_dispatch_one_passes_max_turns_and_max_budget_to_claude(tmp_path: Path, 
     argv = captured["argv"]
     assert argv[argv.index("--max-turns") + 1] == "7"
     assert argv[argv.index("--max-budget-usd") + 1] == "1.5"
+
+
+def test_main_requires_all_three_app_flags_together(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit):
+        fd.main(["--accounts", str(tmp_path / "a"), "--app-id", "4260739"])
+
+
+def test_main_mints_app_token_and_sets_gh_token_env(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+
+    minted = []
+
+    def fake_token(app_id, installation_id, private_key_path):
+        minted.append((app_id, installation_id, private_key_path))
+        return "ghs_minted_token"
+
+    monkeypatch.setattr(fd, "github_app_token", fake_token)
+    monkeypatch.setattr(fd, "_dispatch_one", lambda *a, **k: None)
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    rc = fd.main(
+        [
+            "--accounts", str(tmp_path / "a"),
+            "--app-id", "4260739",
+            "--app-installation-id", "145558758",
+            "--app-private-key", "/path/to/key.pem",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert minted == [("4260739", "145558758", "/path/to/key.pem")]
+    assert os.environ["GH_TOKEN"] == "ghs_minted_token"
+    assert "authenticating as the GitHub App" in out
+
+
+def test_main_without_app_flags_does_not_touch_gh_token_env(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    monkeypatch.setattr(fd, "_dispatch_one", lambda *a, **k: None)
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    fd.main(["--accounts", str(tmp_path / "a")])
+
+    assert "GH_TOKEN" not in os.environ
+
+
+def test_dispatch_one_worker_env_inherits_gh_token_from_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The whole point of setting os.environ["GH_TOKEN"] once in main(): the
+    # spawned worker's `env = {**os.environ, ...}` picks it up with no
+    # separate wiring. Prove that inheritance directly against _dispatch_one.
+    monkeypatch.setenv("GH_TOKEN", "ghs_from_app")
+
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    _init_git_repo(repo_path)
+    subprocess.run(["git", "-C", str(repo_path), "branch", "-M", "main"], check=True)
+
+    monkeypatch.setattr(fd, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(fd, "TRANSCRIPTS_DIR", tmp_path / "transcripts")
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+
+    captured: dict = {}
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            captured["env"] = kwargs.get("env", {})
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    candidate = fd.Candidate(
+        id="repo#1", repo="repo", tool="", title="t", kind="issue", created_at="2020-01-01"
+    )
+    account = _account(tmp_path / "cfg", {"model": "sonnet"})
+
+    fd._dispatch_one(
+        account,
+        candidate,
+        execute=True,
+        max_budget_usd=1.5,
+        max_turns=7,
+        ledger=Ledger(tmp_path / "ledger.jsonl"),
+        org="MyThingsLab",
+    )
+
+    assert captured["env"]["GH_TOKEN"] == "ghs_from_app"
