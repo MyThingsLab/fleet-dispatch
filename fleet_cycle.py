@@ -13,18 +13,19 @@ Order mirrors the authority chain each tool's CLAUDE.md already declares:
   4. mytester run        - per repo, add coverage for one uncovered unit.
   5. mychangelogger update - per repo, fold new dev-ledger entries into CHANGELOG.md.
   6. mydocs sync         - refresh the fleet docs site from each tool's README/CLAUDE.md.
-  7. myprojector sync    - reconcile the org Project board + tracking-issue checklist.
-  8. myreporter post     - post a fleet-wide digest comment on the tracking issue.
-  9. mytelegrambot notify - push everything since the last notify to Telegram.
+  7. mydashboard render  - refresh the org-wide fleet dashboard page.
+  8. myprojector sync    - reconcile the org Project board + tracking-issue checklist.
+  9. myreporter post     - post a fleet-wide digest comment on the tracking issue.
+ 10. mytelegrambot notify - push everything since the last notify to Telegram.
 
 No tool calls another tool's CLI directly (each stays a separate `gh`-attributed
 run, per their CLAUDE.md invariants) -- this script is the external driver that
 chains them, the same role fleet_dispatch.py already plays for orchestrator+workers.
 
 Defaults to a dry run (report only, no mutating subcommands). Pass --execute to
-actually run myresearcher/mytester/mychangelogger/mydocs/myprojector/myreporter/mytelegrambot
-for real; fleet_dispatch's own --execute is passed through separately since it
-spawns billed headless sessions.
+actually run myresearcher/mytester/mychangelogger/mydocs/mydashboard/myprojector/
+myreporter/mytelegrambot for real; fleet_dispatch's own --execute is passed
+through separately since it spawns billed headless sessions.
 """
 
 from __future__ import annotations
@@ -201,7 +202,23 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"(dry run — would run: {' '.join(docs_cmd)})")
 
-    # 7. MyProjector: reconcile the board + tracking-issue checklist.
+    # 7. MyDashboard: refresh the org-wide fleet dashboard page.
+    # Deterministically skips fresh pages (hash check), so this is cheap when
+    # nothing changed; it opens (never merges) one PR when the page is stale.
+    dashboard_cmd = [
+        "mydashboard", "render",
+        "--repo-root", str(docs_site_root),
+        "--workspace", str(WORKSPACE_ROOT),
+        "--engine", args.engine,
+    ]
+    if not docs_site_root.is_dir():
+        print(f"(skipping mydashboard — no local docs-site clone at {docs_site_root})")
+    elif args.execute:
+        _run(dashboard_cmd)
+    else:
+        print(f"(dry run — would run: {' '.join(dashboard_cmd)})")
+
+    # 8. MyProjector: reconcile the board + tracking-issue checklist.
     projector_cmd = [
         "myprojector", "sync",
         "--org", ORG,
@@ -216,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         projector_cmd.append("--dry-run")
     _run(projector_cmd)
 
-    # 8. MyReporter: post the fleet-wide digest on the tracking issue.
+    # 9. MyReporter: post the fleet-wide digest on the tracking issue.
     reporter_cmd = [
         "myreporter", "post",
         "--repo", TRACKING_REPO,
@@ -230,14 +247,14 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(f"(dry run — would run: {' '.join(reporter_cmd)})")
 
-    # 9. MyTelegramBot: push everything since the last notify.
+    # 10. MyTelegramBot: push everything since the last notify.
     if args.execute:
         _run(["mytelegrambot", "notify"])
     else:
         print("(dry run — would run: mytelegrambot notify)")
 
     if not args.execute:
-        print("\n(dry run — pass --execute to run myresearcher/mytester/mychangelogger/mydocs/myprojector/myreporter/mytelegrambot for real; --dispatch-execute for fleet_dispatch's billed sessions)")
+        print("\n(dry run — pass --execute to run myresearcher/mytester/mychangelogger/mydocs/mydashboard/myprojector/myreporter/mytelegrambot for real; --dispatch-execute for fleet_dispatch's billed sessions)")
     return 0
 
 
