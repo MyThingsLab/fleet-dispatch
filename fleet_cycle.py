@@ -26,6 +26,19 @@ Defaults to a dry run (report only, no mutating subcommands). Pass --execute to
 actually run myresearcher/mytester/mychangelogger/mydocs/mydashboard/myprojector/
 myreporter/mytelegrambot for real; fleet_dispatch's own --execute is passed
 through separately since it spawns billed headless sessions.
+
+--loop keeps re-running the 9 steps instead of exiting after one pass, meant for
+an always-on host (see the systemd unit alongside this file's PR). Each
+iteration re-derives the usable account pool via account_usage.select_accounts
+(polled on --account-recheck-min, not every iteration -- each poll is a real
+`claude -p /usage` call per account) and skips step 2 for that iteration if none
+are usable rather than stopping the loop. An iteration that dispatches nothing
+backs off (doubling up to --max-backoff-min) before the next one; one that
+dispatches something resets the backoff. --max-duration-min and
+--max-cycle-budget-usd are optional caps for a bounded run (e.g. testing the
+loop by hand); the systemd deployment omits both and just lets it run
+indefinitely, relying on Restart=on-failure for crash recovery.
+>>>>>>> 7b2f7de (Add fleet_cycle.py --loop for an always-on dispatch daemon)
 """
 
 from __future__ import annotations
@@ -35,7 +48,13 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+from mythings.ledger import Ledger
+
+import account_usage
+from fleet_dispatch import DISPATCH_LEDGER
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
 ORG = "MyThingsLab"
@@ -113,18 +132,7 @@ def _brief_candidates(count: int) -> list[int] | None:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--accounts", required=True, help="passed through to fleet_dispatch.py --accounts")
-    parser.add_argument("--execute", action="store_true", help="run mutating subcommands for real (all steps)")
-    parser.add_argument("--dispatch-execute", action="store_true", help="also let fleet_dispatch spawn real headless sessions (separate from --execute since it's billed)")
-    parser.add_argument("--engine", choices=["noop", "claude-cli"], default="noop", help="Engine backend for planner/tester/projector/reporter")
-    parser.add_argument("--skip-dispatch", action="store_true", help="skip step 2 (fleet_dispatch), useful when it already ran this cycle")
-    parser.add_argument("--brief-count", type=int, default=1, help="max open my-researcher topic issues in MyThingsLab/study to brief per cycle (one billed Engine call each with --engine claude-cli; 0 disables the step)")
-    args = parser.parse_args(argv)
-
-    py = sys.executable
-
+def _run_cycle(args: argparse.Namespace, *, accounts: str, skip_dispatch: bool, py: str) -> None:
     # 1. MyPlanner: refresh the recommended sequence.
     _run([
         "myplanner", "plan",
@@ -136,8 +144,8 @@ def main(argv: list[str] | None = None) -> int:
     ])
 
     # 2. MyOrchestrator + workers: pick and close the next unit(s) of work.
-    if not args.skip_dispatch:
-        dispatch_cmd = [py, str(WORKSPACE_ROOT / "fleet_dispatch.py"), "--accounts", args.accounts]
+    if not skip_dispatch:
+        dispatch_cmd = [py, str(WORKSPACE_ROOT / "fleet_dispatch.py"), "--accounts", accounts]
         if args.dispatch_execute:
             dispatch_cmd.append("--execute")
         _run(dispatch_cmd)
@@ -156,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
                 # ClaudeCLIEngine needs an authenticated CLI; borrow the first
                 # fleet account's CLAUDE_CONFIG_DIR (TAVILY_API_KEY is not set
                 # on this host, so retrieval sticks to keyless arXiv).
-                account = args.accounts.split(",")[0].strip()
+                account = accounts.split(",")[0].strip()
                 env = {**os.environ, "CLAUDE_CONFIG_DIR": str(Path(account).expanduser())}
                 for number in candidates:
                     brief_cmd = [
@@ -252,6 +260,104 @@ def main(argv: list[str] | None = None) -> int:
         _run(["mytelegrambot", "notify"])
     else:
         print("(dry run — would run: mytelegrambot notify)")
+
+
+def _loop_should_stop(
+    *, elapsed_min: float, spent_usd: float, max_duration_min: float | None, max_cycle_budget_usd: float | None,
+) -> str | None:
+    """Pure breakout check, split out from _run_loop so it's testable without
+    a fake clock: returns the reason to stop, or None to keep looping."""
+    if max_duration_min is not None and elapsed_min >= max_duration_min:
+        return f"reached --max-duration-min {max_duration_min} ({elapsed_min:.1f} min elapsed)"
+    if max_cycle_budget_usd is not None and spent_usd >= max_cycle_budget_usd:
+        return f"reached --max-cycle-budget-usd {max_cycle_budget_usd} (${spent_usd:.2f} spent)"
+    return None
+
+
+def _next_backoff_s(current_backoff_s: float, *, dispatched: bool, idle_backoff_s: float, max_backoff_s: float) -> float:
+    if dispatched:
+        return idle_backoff_s
+    return min(current_backoff_s * 2.0, max_backoff_s)
+
+
+def _run_loop(args: argparse.Namespace, py: str) -> int:
+    pool = [a.strip() for a in args.accounts.split(",") if a.strip()]
+    dispatch_ledger = Ledger(DISPATCH_LEDGER)
+    start_usage_count = len(dispatch_ledger.read(tool="fleet_dispatch", kind="usage"))
+    loop_start = time.monotonic()
+    idle_backoff_s = args.idle_backoff_min * 60.0
+    backoff_s = idle_backoff_s
+    last_account_check: float | None = None
+    usable_accounts: list[str] = []
+    iteration = 0
+
+    while True:
+        elapsed_min = (time.monotonic() - loop_start) / 60.0
+        spent_usd = sum(
+            e.data.get("cost_usd", 0.0)
+            for e in dispatch_ledger.read(tool="fleet_dispatch", kind="usage")[start_usage_count:]
+        )
+        stop_reason = _loop_should_stop(
+            elapsed_min=elapsed_min, spent_usd=spent_usd,
+            max_duration_min=args.max_duration_min, max_cycle_budget_usd=args.max_cycle_budget_usd,
+        )
+        if stop_reason is not None:
+            print(f"(--loop stopping: {stop_reason})")
+            return 0
+
+        # account_usage.select_accounts spends one real `claude -p /usage` call
+        # per account, so this is polled on a cadence, not every iteration.
+        now = time.monotonic()
+        if last_account_check is None or (now - last_account_check) >= args.account_recheck_min * 60.0:
+            usable, over = account_usage.select_accounts(pool, args.max_session_pct)
+            usable_accounts = [u.config_dir for u in usable]
+            last_account_check = now
+            if over:
+                print(f"(accounts over {args.max_session_pct}%: {[u.config_dir for u in over]})")
+
+        iteration += 1
+        print(f"\n=== loop iteration {iteration} ({elapsed_min:.1f} min elapsed, ${spent_usd:.2f} spent) ===")
+        skip_dispatch = args.skip_dispatch or not usable_accounts
+        if not usable_accounts:
+            print("(no usable accounts this iteration — skipping dispatch, not stopping the loop)")
+
+        entries_before = len(dispatch_ledger.read(tool="fleet_dispatch"))
+        cycle_accounts = ",".join(usable_accounts) if usable_accounts else args.accounts
+        _run_cycle(args, accounts=cycle_accounts, skip_dispatch=skip_dispatch, py=py)
+        dispatched = len(dispatch_ledger.read(tool="fleet_dispatch")) > entries_before
+
+        backoff_s = _next_backoff_s(
+            backoff_s, dispatched=dispatched, idle_backoff_s=idle_backoff_s,
+            max_backoff_s=args.max_backoff_min * 60.0,
+        )
+        if not dispatched:
+            print(f"(nothing dispatched this iteration — backing off {backoff_s:.0f}s)")
+            time.sleep(backoff_s)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--accounts", required=True, help="passed through to fleet_dispatch.py --accounts (--loop: the candidate pool, re-filtered each recheck)")
+    parser.add_argument("--execute", action="store_true", help="run mutating subcommands for real (all steps)")
+    parser.add_argument("--dispatch-execute", action="store_true", help="also let fleet_dispatch spawn real headless sessions (separate from --execute since it's billed)")
+    parser.add_argument("--engine", choices=["noop", "claude-cli"], default="noop", help="Engine backend for planner/tester/projector/reporter")
+    parser.add_argument("--skip-dispatch", action="store_true", help="skip step 2 (fleet_dispatch); --loop: applies to every iteration")
+    parser.add_argument("--brief-count", type=int, default=1, help="max open my-researcher topic issues in MyThingsLab/study to brief per cycle (one billed Engine call each with --engine claude-cli; 0 disables the step)")
+    parser.add_argument("--loop", action="store_true", help="keep cycling instead of running once (see module docstring)")
+    parser.add_argument("--max-duration-min", type=float, default=None, help="--loop only: stop after this many wall-clock minutes (default: run indefinitely)")
+    parser.add_argument("--max-cycle-budget-usd", type=float, default=None, help="--loop only: stop once fleet_dispatch's aggregate cost_usd since the loop started reaches this cap (default: no cap)")
+    parser.add_argument("--account-recheck-min", type=float, default=10.0, help="--loop only: how often to re-poll account_usage.select_accounts")
+    parser.add_argument("--max-session-pct", type=int, default=90, help="--loop only: per-account session-usage ceiling passed to account_usage.select_accounts")
+    parser.add_argument("--idle-backoff-min", type=float, default=1.0, help="--loop only: backoff between iterations that dispatched nothing")
+    parser.add_argument("--max-backoff-min", type=float, default=30.0, help="--loop only: backoff ceiling")
+    args = parser.parse_args(argv)
+
+    py = sys.executable
+
+    if args.loop:
+        return _run_loop(args, py)
+
+    _run_cycle(args, accounts=args.accounts, skip_dispatch=args.skip_dispatch, py=py)
 
     if not args.execute:
         print("\n(dry run — pass --execute to run myresearcher/mytester/mychangelogger/mydocs/mydashboard/myprojector/myreporter/mytelegrambot for real; --dispatch-execute for fleet_dispatch's billed sessions)")

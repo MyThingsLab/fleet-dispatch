@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -130,3 +132,161 @@ def test_gh_json_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: Failed())
     assert fc._gh_json(["issue", "list"]) is None
+
+
+# ---- --loop ----------------------------------------------------------------
+
+
+class _FakeClock:
+    """time.monotonic()/time.sleep() stand-in: sleep advances the fake clock
+    instead of actually blocking, so loop tests run instantly."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _loop_ns(**overrides: object) -> argparse.Namespace:
+    defaults: dict[str, object] = dict(
+        accounts="/tmp/acct1,/tmp/acct2",
+        execute=False,
+        dispatch_execute=False,
+        engine="noop",
+        skip_dispatch=False,
+        brief_count=0,
+        loop=True,
+        max_duration_min=None,
+        max_cycle_budget_usd=None,
+        account_recheck_min=10.0,
+        max_session_pct=90,
+        idle_backoff_min=1.0,
+        max_backoff_min=30.0,
+    )
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
+
+
+def _usable(pool: list[str]) -> tuple[list[SimpleNamespace], list[SimpleNamespace]]:
+    return [SimpleNamespace(config_dir=d) for d in pool], []
+
+
+def test_loop_should_stop_none_when_no_caps() -> None:
+    assert fc._loop_should_stop(
+        elapsed_min=999, spent_usd=999, max_duration_min=None, max_cycle_budget_usd=None
+    ) is None
+
+
+def test_loop_should_stop_on_duration_cap() -> None:
+    reason = fc._loop_should_stop(elapsed_min=10, spent_usd=0, max_duration_min=5, max_cycle_budget_usd=None)
+    assert reason is not None and "max-duration-min" in reason
+
+
+def test_loop_should_stop_on_budget_cap() -> None:
+    reason = fc._loop_should_stop(elapsed_min=0, spent_usd=5, max_duration_min=None, max_cycle_budget_usd=3)
+    assert reason is not None and "max-cycle-budget-usd" in reason
+
+
+def test_next_backoff_resets_to_idle_on_dispatch() -> None:
+    assert fc._next_backoff_s(240.0, dispatched=True, idle_backoff_s=60.0, max_backoff_s=1800.0) == 60.0
+
+
+def test_next_backoff_doubles_and_caps_when_idle() -> None:
+    assert fc._next_backoff_s(10.0, dispatched=False, idle_backoff_s=60.0, max_backoff_s=1800.0) == 20.0
+    assert fc._next_backoff_s(1200.0, dispatched=False, idle_backoff_s=60.0, max_backoff_s=1800.0) == 1800.0
+
+
+def test_run_loop_stops_at_max_duration(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(fc, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    clock = _FakeClock()
+    monkeypatch.setattr(fc.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(fc.time, "sleep", clock.sleep)
+    monkeypatch.setattr(fc, "_run_cycle", lambda *a, **k: None)  # never dispatches -> always backs off
+    monkeypatch.setattr(fc.account_usage, "select_accounts", lambda pool, pct: _usable(pool))
+
+    result = fc._run_loop(_loop_ns(max_duration_min=5.0), "python3")
+    assert result == 0
+    assert clock.now >= 5.0 * 60.0
+
+
+def test_run_loop_stops_at_budget_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(fc, "DISPATCH_LEDGER", ledger_path)
+    ledger = fc.Ledger(ledger_path)
+
+    def fake_run_cycle(args: argparse.Namespace, *, accounts: str, skip_dispatch: bool, py: str) -> None:
+        ledger.record(tool="fleet_dispatch", kind="usage", outcome="success", detail="", cost_usd=2.0)
+
+    monkeypatch.setattr(fc, "_run_cycle", fake_run_cycle)
+    monkeypatch.setattr(fc.account_usage, "select_accounts", lambda pool, pct: _usable(pool))
+
+    result = fc._run_loop(_loop_ns(max_cycle_budget_usd=3.0), "python3")
+    assert result == 0
+    spent = sum(e.data["cost_usd"] for e in ledger.read(tool="fleet_dispatch", kind="usage"))
+    assert spent >= 3.0
+
+
+def test_run_loop_skips_dispatch_when_no_usable_accounts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(fc, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+
+    class _StopLoop(Exception):
+        pass
+
+    calls = []
+
+    def fake_run_cycle(args: argparse.Namespace, *, accounts: str, skip_dispatch: bool, py: str) -> None:
+        calls.append((accounts, skip_dispatch))
+        raise _StopLoop
+
+    monkeypatch.setattr(fc, "_run_cycle", fake_run_cycle)
+    over = SimpleNamespace(config_dir="/tmp/acct1")
+    monkeypatch.setattr(fc.account_usage, "select_accounts", lambda pool, pct: ([], [over]))
+
+    with pytest.raises(_StopLoop):
+        fc._run_loop(_loop_ns(), "python3")
+
+    assert calls == [("/tmp/acct1,/tmp/acct2", True)]
+
+
+def test_run_loop_rechecks_accounts_on_cadence_not_every_iteration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(fc, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    clock = _FakeClock()
+    monkeypatch.setattr(fc.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(fc.time, "sleep", clock.sleep)
+    monkeypatch.setattr(fc, "_run_cycle", lambda *a, **k: None)
+
+    calls: list[list[str]] = []
+
+    def fake_select(pool: list[str], pct: int) -> tuple[list[SimpleNamespace], list[SimpleNamespace]]:
+        calls.append(pool)
+        return _usable(pool)
+
+    monkeypatch.setattr(fc.account_usage, "select_accounts", fake_select)
+
+    fc._run_loop(
+        _loop_ns(max_duration_min=1.0, idle_backoff_min=0.1, max_backoff_min=0.1, account_recheck_min=10.0),
+        "python3",
+    )
+    # 1 min of wall time at a 0.1 min (6s) fixed backoff is ~10 iterations, but
+    # the 10-min recheck cadence never elapses within that -- one poll, not ten.
+    assert len(calls) == 1
+
+
+def test_main_loop_flag_dispatches_to_run_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_run_loop(args: argparse.Namespace, py: str) -> int:
+        captured["accounts"] = args.accounts
+        captured["max_duration_min"] = args.max_duration_min
+        return 0
+
+    monkeypatch.setattr(fc, "_run_loop", fake_run_loop)
+    rc = fc.main(["--accounts", "/tmp/acct", "--loop", "--max-duration-min", "5"])
+    assert rc == 0
+    assert captured == {"accounts": "/tmp/acct", "max_duration_min": 5.0}
