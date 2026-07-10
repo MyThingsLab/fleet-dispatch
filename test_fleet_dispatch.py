@@ -698,6 +698,101 @@ def test_finalize_pr_needs_review_when_no_ci_checks(monkeypatch) -> None:
     assert outcome == "needs_review"
 
 
+def test_abort_arms_halt_marker_without_needing_accounts(tmp_path: Path, monkeypatch) -> None:
+    marker = tmp_path / "HALT"
+    monkeypatch.setattr(fd, "HALT_MARKER", marker)
+
+    rc = fd.main(["--abort"])
+
+    assert rc == 0
+    assert marker.exists()
+
+
+def test_clear_halt_removes_marker(tmp_path: Path, monkeypatch) -> None:
+    marker = tmp_path / "HALT"
+    marker.write_text("halted at some point\n")
+    monkeypatch.setattr(fd, "HALT_MARKER", marker)
+
+    rc = fd.main(["--clear-halt"])
+
+    assert rc == 0
+    assert not marker.exists()
+
+
+def test_clear_halt_when_not_set_is_a_noop(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(fd, "HALT_MARKER", tmp_path / "HALT")
+
+    rc = fd.main(["--clear-halt"])
+
+    assert rc == 0
+
+
+def test_abort_and_clear_halt_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        fd.main(["--abort", "--clear-halt"])
+
+
+def _dispatch_stub(calls: list) -> callable:
+    def fake_dispatch_one(*a, **k):
+        calls.append(k)
+
+    return fake_dispatch_one
+
+
+def _wire_single_candidate_orchestrator(monkeypatch) -> None:
+    candidates = [
+        fd.Candidate(id="repo#1", repo="repo", tool="", title="t1", kind="issue", created_at="2020-01-01"),
+    ]
+
+    class FakeRecommendation:
+        def __init__(self, chosen: fd.Candidate) -> None:
+            self.chosen = chosen
+
+    class FakeOrchestrator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def next_n(self, _n: int) -> list[FakeRecommendation]:
+            return [FakeRecommendation(c) for c in candidates]
+
+    monkeypatch.setattr(fd, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+    monkeypatch.setattr(fd, "_last_attempt", lambda *a, **k: None)
+
+
+def test_main_refuses_execute_when_halted(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(fd, "HALT_MARKER", tmp_path / "HALT")
+    (tmp_path / "HALT").write_text("halted\n")
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    calls: list = []
+    monkeypatch.setattr(fd, "_dispatch_one", _dispatch_stub(calls))
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a"), "--execute"])
+
+    assert rc == 1
+    assert calls == [], "the kill switch must stop launch before any session starts"
+
+
+def test_main_dry_run_still_reports_when_halted(tmp_path: Path, monkeypatch, capsys) -> None:
+    # A dry run spends nothing, so the marker is informational there, not a
+    # block -- symmetric with how --max-daily-usd treats dry runs.
+    monkeypatch.setattr(fd, "HALT_MARKER", tmp_path / "HALT")
+    (tmp_path / "HALT").write_text("halted\n")
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    calls: list = []
+    monkeypatch.setattr(fd, "_dispatch_one", _dispatch_stub(calls))
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a")])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "HALT marker present" in out
+    assert len(calls) == 1  # dry-run _dispatch_one still runs; it just prints and returns
+
+
 def _usage_entry(ledger: Ledger, *, cost_usd: float, ts: str) -> None:
     ledger.append(
         LedgerEntry(tool="fleet_dispatch", kind="usage", outcome="success", ts=ts, data={"cost_usd": cost_usd})

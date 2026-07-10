@@ -100,6 +100,25 @@ python3 fleet_cycle.py --accounts ~/.claude-lorenzoliuzzo,~/.claude-mythingslab 
 (tester/changelogger/projector/reporter/telegram) is not — you can run the
 bookkeeping half of the loop freely and opt into spawning workers separately.
 
+## Kill switch
+
+To stop `fleet_dispatch.py --execute` from launching anything — right now,
+across every account, until you say otherwise:
+
+```bash
+python3 fleet_dispatch.py --abort        # arm it: no --accounts needed
+python3 fleet_dispatch.py --clear-halt   # disarm it once it's safe to resume
+```
+
+`--abort` touches a marker file (`.fleet-dispatch/HALT`); every `--execute` run
+checks for it before launching a single session and refuses outright if it's
+there (a dry run still reports normally, just with a note). Since `fleet_cycle.py`
+shells out to `fleet_dispatch.py` for its dispatch step, arming the marker halts
+that path too. It doesn't reach into a session already running — those are
+already bounded by `--max-budget-usd`/`--max-turns` and end on their own — it
+stops the *next* one, so running `--abort` mid-flight leaves no half-written
+state to clean up: whatever already pushed stays pushed, and nothing new starts.
+
 ## Provenance
 
 Every tool records its own build history under its `dev-ledger/`
