@@ -93,6 +93,33 @@ def test_main_skips_briefs_when_study_clone_missing(
     assert "no study clone" in capsys.readouterr().out
 
 
+def test_main_execute_runs_mydashboard_render_after_mydocs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _capture_runs(monkeypatch)
+    monkeypatch.setattr(fc, "WORKSPACE_ROOT", tmp_path)
+    docs_site_root = tmp_path / fc.DOCS_SITE_CLONE
+    docs_site_root.mkdir()
+    fc.main(["--accounts", "/tmp/acct", "--skip-dispatch", "--execute", "--brief-count", "0"])
+    tools = [cmd[0] for cmd, _ in calls]
+    assert "mydashboard" in tools
+    assert tools.index("mydocs") < tools.index("mydashboard") < tools.index("myprojector")
+    dashboard_cmd, _ = next((cmd, env) for cmd, env in calls if cmd[0] == "mydashboard")
+    assert dashboard_cmd[1] == "render"
+    assert dashboard_cmd[dashboard_cmd.index("--repo-root") + 1] == str(docs_site_root)
+    assert dashboard_cmd[dashboard_cmd.index("--workspace") + 1] == str(tmp_path)
+
+
+def test_main_skips_mydashboard_when_docs_site_clone_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _capture_runs(monkeypatch)
+    monkeypatch.setattr(fc, "WORKSPACE_ROOT", tmp_path)
+    fc.main(["--accounts", "/tmp/acct", "--skip-dispatch", "--execute", "--brief-count", "0"])
+    assert not any(cmd[0] == "mydashboard" for cmd, _ in calls)
+    assert "skipping mydashboard" in capsys.readouterr().out
+
+
 def test_gh_json_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     import subprocess
 
