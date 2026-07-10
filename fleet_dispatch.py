@@ -335,6 +335,19 @@ def _prompt_for(
         "is paused, not failed, until the blocker is resolved.\n\n"
     )
 
+    critical_block = (
+        "If while working you discover a SEPARATE bug that is a security issue "
+        "or breaks a core invariant shared across the fleet (a `my-things-core` "
+        "contract, the build harness, or anything that would let other tools "
+        "ship broken work on top of it), file it immediately with "
+        "`gh issue create --label critical --label bug --repo MyThingsLab/<repo>` "
+        "describing exactly what's broken and its blast radius. That label halts "
+        "new fleet dispatch org-wide until it's closed -- do not wait until you "
+        f"finish this task to file it. Filing it does not abort your own work; "
+        f"keep going on issue #{number} unless the critical bug blocks it "
+        "directly, in which case treat it as a blocker per the paragraph above.\n\n"
+    )
+
     return (
         resume_block
         + f"Work issue #{number} in the {repo} repo (`gh issue view {number} --repo "
@@ -346,6 +359,7 @@ def _prompt_for(
         f"your Read, Edit, Write, Glob and Grep tools over shelling out to `ls`, "
         f"`cat`, `find` or `grep` to inspect the repo.\n\n"
         + blocker_block
+        + critical_block
         + "Follow this repo's own CLAUDE.md and HARNESS.md exactly. Make the smallest "
         "change that closes the issue, with tests. Do not read or edit generated / "
         "vendored / provenance paths — .venv, __pycache__, .ruff_cache, "
@@ -442,6 +456,25 @@ def _checks_state(org: str, repo: str, number: int) -> str:
     if any(b == "pending" for b in buckets):
         return "pending"
     return "pass"
+
+
+def _critical_halt_issues(org: str) -> list[dict]:
+    # Any open `critical`-labelled issue anywhere in the org is a soft halt:
+    # new dispatch stops fleet-wide until it's closed. See CONVENTIONS.md
+    # "Filing bugs".
+    result = subprocess.run(
+        [
+            "gh", "search", "issues", "--owner", org, "--state", "open",
+            "--label", "critical", "--json", "repository,number,title,url",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
 
 
 def _wait_for_checks(
@@ -1091,6 +1124,26 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  - {p}")
             return 1
         print("rtk output-compression hook verified for every account")
+
+    # Soft halt: a `critical`-labelled issue open anywhere in the org means
+    # something security-relevant or fleet-wide-invariant-breaking is
+    # unresolved. Stop starting new work until it's closed -- in-flight
+    # workers still finish normally. See CONVENTIONS.md "Filing bugs".
+    critical_issues = _critical_halt_issues(args.org)
+    if critical_issues:
+        dispatch_ledger = Ledger(DISPATCH_LEDGER)
+        refs = [f"{i['repository']['nameWithOwner']}#{i['number']}" for i in critical_issues]
+        print("halted: critical issue(s) open, not dispatching new work:")
+        for i, ref in zip(critical_issues, refs):
+            print(f"  - {ref}: {i['title']} ({i['url']})")
+        dispatch_ledger.record(
+            tool="fleet_dispatch",
+            kind="dispatch",
+            outcome="halted_critical",
+            detail=f"{len(refs)} critical issue(s) open: {', '.join(refs)}",
+            issues=refs,
+        )
+        return 0
 
     orch = Orchestrator(
         org=args.org,
