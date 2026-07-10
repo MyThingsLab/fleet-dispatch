@@ -124,6 +124,18 @@ def _utc_ts() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _today_spend_usd(ledger: Ledger, *, today: str | None = None) -> float:
+    # UTC calendar day, matching _utc_ts/_utc_now elsewhere in this file — a
+    # daily cap that drifted with the host's local timezone would reset at an
+    # unpredictable wall-clock hour.
+    day = today or datetime.now(UTC).strftime("%Y-%m-%d")
+    return sum(
+        float(e.data.get("cost_usd", 0.0))
+        for e in ledger.read(tool="fleet_dispatch", kind="usage")
+        if e.ts.startswith(day)
+    )
+
+
 def _load_allowed_tools() -> list[str]:
     if ALLOWED_TOOLS_PATH.exists():
         return json.loads(ALLOWED_TOOLS_PATH.read_text())
@@ -683,6 +695,7 @@ def _dispatch_one(
     *,
     execute: bool,
     max_budget_usd: float,
+    max_turns: int,
     ledger: Ledger,
     org: str,
     prior: Attempt | None = None,
@@ -710,7 +723,7 @@ def _dispatch_one(
         f"\n=== {account.name} -> {candidate.id} ({repo}) [{mode}] ===\n"
         f"  branch: {branch} (base {base_ref})\n"
         f"  config: {account.config_dir}\n"
-        f"  budget cap: ${max_budget_usd}\n"
+        f"  budget cap: ${max_budget_usd}, turn cap: {max_turns}\n"
         f"  prompt: {prompt}"
     )
 
@@ -762,6 +775,8 @@ def _dispatch_one(
                 "--verbose",
                 "--max-budget-usd",
                 str(max_budget_usd),
+                "--max-turns",
+                str(max_turns),
                 "--disallowedTools",
                 *DEFAULT_DENY_READS,
                 "--allowedTools",
@@ -900,6 +915,20 @@ def main(argv: list[str] | None = None) -> int:
         help="dollar cap passed to each headless claude session (default: $3)",
     )
     parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=40,
+        help="turn cap passed to each headless claude session (default: 40)",
+    )
+    parser.add_argument(
+        "--max-daily-usd",
+        type=float,
+        default=20.0,
+        help="hard ceiling on total fleet_dispatch spend (all accounts, kind=usage "
+        "ledger entries) per UTC calendar day; a run that would push projected "
+        "spend over this refuses to launch anything, before spend (default: $20)",
+    )
+    parser.add_argument(
         "--ready-timeout",
         type=float,
         default=600.0,
@@ -1003,6 +1032,25 @@ def main(argv: list[str] | None = None) -> int:
         plan.append((c, prior if decision == "resume" else None))
 
     pairs = list(zip(accounts, plan))
+
+    # Enforced before spend, not after: sum today's actual usage-ledger cost
+    # plus the worst case for every session this run is about to launch, and
+    # refuse the whole run if that would cross the daily ceiling. A dry run
+    # spends nothing, so it's exempt.
+    if args.execute and pairs:
+        spent_today = _today_spend_usd(dispatch_ledger)
+        projected = spent_today + len(pairs) * args.max_budget_usd
+        if projected > args.max_daily_usd:
+            print(
+                f"refusing to launch: today's fleet_dispatch spend is already "
+                f"${spent_today:.2f}, and {len(pairs)} more session(s) at up to "
+                f"${args.max_budget_usd:.2f} each could reach ${projected:.2f}, "
+                f"over the ${args.max_daily_usd:.2f}/day cap (--max-daily-usd). "
+                f"Raise --max-daily-usd, lower --max-budget-usd, or wait for the "
+                f"UTC day to roll over."
+            )
+            return 1
+
     failures: list[tuple[Account, Candidate, BaseException]] = []
     if pairs:
         # One worker thread per account: each already runs in its own git
@@ -1017,6 +1065,7 @@ def main(argv: list[str] | None = None) -> int:
                     candidate,
                     execute=args.execute,
                     max_budget_usd=args.max_budget_usd,
+                    max_turns=args.max_turns,
                     ledger=dispatch_ledger,
                     org=args.org,
                     prior=prior,
