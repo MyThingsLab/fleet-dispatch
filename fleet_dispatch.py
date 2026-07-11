@@ -40,6 +40,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -51,6 +52,7 @@ from mythings.github import github_app_token
 from mythings.isolation import Workspace
 from mythings.ledger import Ledger
 
+import fleet_ask
 from fleet_usage import SAFE_FAMILY_PATTERNS, UsageReport, family_for, parse_transcript
 from myorchestrator.candidates import Candidate
 from myorchestrator.manifest import default_manifest_path
@@ -989,6 +991,25 @@ def main(argv: list[str] | None = None) -> int:
         "--execute operation.",
     )
     parser.add_argument(
+        "--ask-human",
+        action="store_true",
+        help="arm the ASK escalation: a Policy ASK a worker's tool hits becomes a "
+        "real Allow/Deny prompt in Telegram instead of collapsing to DENY. Needs a "
+        "running `mytelegrambot run` daemon, and refuses to start without one -- a "
+        "channel nobody answers is slower than no channel and just as closed.",
+    )
+    parser.add_argument(
+        "--ask-remote-daemon",
+        action="store_true",
+        help="skip the local daemon check: it runs on another host sharing this ledger.",
+    )
+    parser.add_argument(
+        "--ask-timeout",
+        type=int,
+        default=fleet_ask.DEFAULT_ASK_TIMEOUT,
+        help="seconds to wait for the human to tap Allow/Deny (default: %(default)s).",
+    )
+    parser.add_argument(
         "--rtk",
         action="store_true",
         help="enable rtk output compression: preflight-verify the rtk hook is "
@@ -1065,6 +1086,19 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print("no HALT marker was set")
         return 0
+
+    if args.ask_human:
+        # Armed in this process's environment, which every headless worker inherits
+        # (`env = {**os.environ, ...}` below), so a tool a worker invokes escalates
+        # its ASKs to a real human instead of having them silently denied.
+        try:
+            wiring = fleet_ask.enable(
+                timeout=args.ask_timeout, remote_daemon=args.ask_remote_daemon
+            )
+        except fleet_ask.AskChannelUnavailable as exc:
+            print(f"fleet_dispatch: cannot arm the ask channel: {exc}", file=sys.stderr)
+            return 2
+        print(f"ask channel armed -> {wiring['MYTHINGS_ASK_CMD']}")
 
     if not args.accounts:
         parser.error("--accounts must list at least one CLAUDE_CONFIG_DIR")

@@ -53,6 +53,7 @@ from pathlib import Path
 from mythings.ledger import Ledger
 
 import account_usage
+import fleet_ask
 from cycle_driver import run_command
 from fleet_dispatch import DISPATCH_LEDGER
 
@@ -340,6 +341,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dispatch-execute", action="store_true", help="also let fleet_dispatch spawn real headless sessions (separate from --execute since it's billed)")
     parser.add_argument("--engine", choices=["noop", "claude-cli"], default="noop", help="Engine backend for planner/tester/projector/reporter")
     parser.add_argument("--skip-dispatch", action="store_true", help="skip step 2 (fleet_dispatch); --loop: applies to every iteration")
+    parser.add_argument(
+        "--ask-human",
+        action="store_true",
+        help=(
+            "arm the ASK escalation: a Policy ASK becomes a real Allow/Deny prompt in "
+            "Telegram instead of collapsing to DENY. Needs a running `mytelegrambot run` "
+            "daemon, and refuses to start without one -- a channel nobody answers is "
+            "slower than no channel and just as closed."
+        ),
+    )
+    parser.add_argument(
+        "--ask-remote-daemon",
+        action="store_true",
+        help="skip the local daemon check: it runs on another host sharing this ledger",
+    )
+    parser.add_argument(
+        "--ask-timeout",
+        type=int,
+        default=fleet_ask.DEFAULT_ASK_TIMEOUT,
+        help="seconds to wait for the human to tap Allow/Deny (default: %(default)s)",
+    )
     parser.add_argument("--brief-count", type=int, default=1, help="max open my-researcher topic issues in MyThingsLab/study to brief per cycle (one billed Engine call each with --engine claude-cli; 0 disables the step)")
     parser.add_argument("--loop", action="store_true", help="keep cycling instead of running once (see module docstring)")
     parser.add_argument("--max-duration-min", type=float, default=None, help="--loop only: stop after this many wall-clock minutes (default: run indefinitely)")
@@ -349,6 +371,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--idle-backoff-min", type=float, default=1.0, help="--loop only: backoff between iterations that dispatched nothing")
     parser.add_argument("--max-backoff-min", type=float, default=30.0, help="--loop only: backoff ceiling")
     args = parser.parse_args(argv)
+
+    if args.ask_human:
+        # Arms it for this process, and so for every tool CLI and headless worker
+        # spawned below -- they all inherit the environment. Without this the
+        # fleet's ASKs are still silently denied.
+        try:
+            wiring = fleet_ask.enable(
+                timeout=args.ask_timeout, remote_daemon=args.ask_remote_daemon
+            )
+        except fleet_ask.AskChannelUnavailable as exc:
+            print(f"fleet_cycle: cannot arm the ask channel: {exc}", file=sys.stderr)
+            return 2
+        print(f"ask channel armed -> {wiring['MYTHINGS_ASK_CMD']}")
 
     py = sys.executable
 

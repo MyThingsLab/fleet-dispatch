@@ -110,6 +110,41 @@ python3 fleet_cycle.py --accounts ~/.claude-lorenzoliuzzo,~/.claude-mythingslab 
 (tester/changelogger/projector/reporter/telegram) is not — you can run the
 bookkeeping half of the loop freely and opt into spawning workers separately.
 
+## Asking a human (`--ask-human`)
+
+MyGuard answers `ASK` when an action needs a human's blessing. Unattended there
+was nobody to ask, so every caller's `PolicyResult.under(unattended=True)`
+collapsed it to `DENY` — correct, but the human was *never actually asked*, and
+MyTelegramBot's whole reason for existing (turning an `ASK` into a real Allow/Deny
+prompt) sat unplugged with zero callers.
+
+`--ask-human` on either driver arms the channel:
+
+```bash
+python3 fleet_cycle.py --accounts ... --execute --ask-human
+python3 fleet_dispatch.py --accounts ... --execute --ask-human
+```
+
+It exports `MYTHINGS_ASK_CMD`, which every tool CLI and headless worker inherits,
+so a bare `Guard()` anywhere in the fleet escalates its `ASK`s to Telegram and
+honours the tap. **Exit 0 is the human's ALLOW; anything else — deny, timeout,
+crash — is a `DENY`.** Fail-closed throughout; unset the variable and behavior is
+exactly what it was.
+
+Two things that fail *silently* if you get them wrong, so the driver refuses
+rather than let you:
+
+- **The ledger is the rendezvous.** `mytelegrambot ask` blocks on a `kind=callback`
+  entry that the *daemon* writes. Its `--ledger` default is cwd-relative, and a
+  worker runs in a git worktree — so the default would point at a ledger nobody
+  writes to and every prompt would time out into a `DENY`. `--ask-human` always
+  passes the daemon's absolute path.
+- **The daemon must be running.** Wired to a dead daemon, every `ASK` blocks for
+  the full timeout and *then* denies: slower than no channel and just as closed.
+  The driver preflights for a live `mytelegrambot run` and refuses to start
+  without one. Pass `--ask-remote-daemon` if it runs on another host sharing the
+  ledger (the Pi), and `--ask-timeout` to tune the per-ask wait (default 300s).
+
 ## Kill switch
 
 To stop `fleet_dispatch.py --execute` from launching anything — right now,
