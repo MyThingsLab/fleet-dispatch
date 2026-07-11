@@ -54,6 +54,7 @@ from pathlib import Path
 from mythings.ledger import Ledger
 
 import account_usage
+from cycle_driver import run_command
 from fleet_dispatch import DISPATCH_LEDGER
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
@@ -87,11 +88,9 @@ def tool_repos(root: Path) -> list[str]:
 
 
 def _run(cmd: list[str], *, check: bool = False, env: dict[str, str] | None = None) -> int:
-    print(f"$ {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=WORKSPACE_ROOT, env=env)
-    if check and result.returncode != 0:
-        raise SystemExit(result.returncode)
-    return result.returncode
+    # Thin adapter over the shared driver's runner: fixes cwd to the workspace
+    # root and keeps the (cmd, *, check, env) signature the cycle's steps call.
+    return run_command(cmd, cwd=WORKSPACE_ROOT, env=env, check=check)
 
 
 def _gh_json(argv: list[str]) -> list[dict] | None:
