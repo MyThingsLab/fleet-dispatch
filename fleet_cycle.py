@@ -27,7 +27,7 @@ actually run myresearcher/mytester/mychangelogger/mydocs/mydashboard/myprojector
 myreporter/mytelegrambot for real; fleet_dispatch's own --execute is passed
 through separately since it spawns billed headless sessions.
 
---loop keeps re-running the 9 steps instead of exiting after one pass, meant for
+--loop keeps re-running the 10 steps instead of exiting after one pass, meant for
 an always-on host (see the systemd unit alongside this file's PR). Each
 iteration re-derives the usable account pool via account_usage.select_accounts
 (polled on --account-recheck-min, not every iteration -- each poll is a real
@@ -38,7 +38,6 @@ dispatches something resets the backoff. --max-duration-min and
 --max-cycle-budget-usd are optional caps for a bounded run (e.g. testing the
 loop by hand); the systemd deployment omits both and just lets it run
 indefinitely, relying on Restart=on-failure for crash recovery.
->>>>>>> 7b2f7de (Add fleet_cycle.py --loop for an always-on dispatch daemon)
 """
 
 from __future__ import annotations
