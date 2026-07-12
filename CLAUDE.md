@@ -3,9 +3,16 @@
 This directory holds the MyThingsLab tool fleet: `my-things-core/` (the SDK —
 the five contracts plus build tooling) and one sibling repo per `My[X]` tool,
 each scaffolded from `my-template/`. The root itself is the `fleet-dispatch`
-repo: `fleet_dispatch.py` (pick-and-build workers) and `fleet_cycle.py` (the
-full autonomous loop). `README.md` here narrates how the fleet chains together;
-`TODO.md` is the curated org backlog.
+repo, but its scripts now live in the sibling
+[`my-fleet/`](https://github.com/MyThingsLab/my-fleet) repo:
+`myfleet.fleet_dispatch` (pick-and-build workers) and `myfleet.fleet_cycle`
+(the full autonomous loop), plus the cross-repo test gate, ASK-channel merge
+routing, and usage/account monitoring — see `my-fleet/README.md` and
+`my-fleet/CLAUDE.md`. This root repo keeps only `dev-ledger/` (its own build
+provenance) and `.fleet-dispatch/` (the dispatch loop's runtime ledger dir,
+still read/written from the fleet root by `my-fleet`'s scripts). `README.md`
+here narrates how the fleet chains together; `TODO.md` is the curated org
+backlog.
 
 ## Instruction hierarchy
 
