@@ -14,7 +14,8 @@ shared SDK, [`my-things-core`](my-things-core/).
 | [my-guard](my-guard/) | Rule engine: evaluates an `Action` to allow/ask/deny. | policy for every `git`/`gh` side effect |
 | [my-planner](my-planner/) | Priority-ordered, multi-item plan across the whole backlog. | recommends a sequence; never dispatches |
 | [my-orchestrator](my-orchestrator/) | Picks the single next unit of work for the next available worker. | decides; never builds, never chains into another tool's CLI |
-| *(worker)* | A headless `claude -p` session, dispatched by [`fleet_dispatch.py`](fleet_dispatch.py), closes the picked issue as a PR. | builds |
+| *(worker)* | A headless `claude -p` session, dispatched by [my-fleet](https://github.com/MyThingsLab/my-fleet)'s `fleet_dispatch`, closes the picked issue as a PR. | builds |
+| [my-fleet](https://github.com/MyThingsLab/my-fleet) | Chains every tool's own CLI into the autonomous cycle (dispatch loop, test gate, ASK-channel merge routing, usage monitoring). | external driver; not a `My[X]` product tool |
 | [my-tester](my-tester/) | Finds one uncovered unit, opens a PR adding a test for it. | writes code (tests only) |
 | [my-changelogger](my-changelogger/) | Folds new `dev-ledger` entries into `CHANGELOG.md`. | writes docs (changelog only) |
 | [my-projector](my-projector/) | Reconciles the org Project board + tracking-issue checklist to live repo state. | bookkeeping, no priority judgment |
@@ -32,55 +33,17 @@ loop.
 ## The autonomous cycle
 
 No tool calls another tool's CLI directly — each run is its own
-`gh`-attributed, ledger-recorded action, per every tool's own invariants. Two
-scripts at this root are the external drivers that chain them:
-
-- **[`fleet_dispatch.py`](fleet_dispatch.py)** — the pick-and-build step:
-  imports `Orchestrator` as a library to rank candidates, then fans them out
-  across one or more `claude -p` accounts, each in its own git-worktree
-  sandbox, with resume/recover across attempts (durable branches, cross-repo
-  blocker protocol, `needs_human` after repeated failures).
-- **[`fleet_cycle.py`](fleet_cycle.py)** — the full loop, in order:
-
-  1. `myplanner plan` — refresh the recommended sequence (feeds
-     `myorchestrator`'s ranking as one more urgency signal).
-  2. `fleet_dispatch.py` — `myorchestrator` picks the next unit(s); workers
-     close them as PRs.
-  3. `mytester run` (per repo) — add coverage for one uncovered unit.
-  4. `mychangelogger update` (per repo) — fold new ledger entries into
-     `CHANGELOG.md`.
-  5. `mydocs sync` — refresh the fleet docs site from each tool's
-     `README.md`/`CLAUDE.md` (deterministic hash check; opens, never merges,
-     one PR when pages are stale).
-  6. `myprojector sync` — reconcile the org Project board + tracking-issue
-     checklist.
-  7. `myreporter post` — post a fleet-wide digest on the tracking issue.
-  8. `mytelegrambot notify` — push everything since the last notify.
-
-  The per-repo steps auto-discover every checkout with a `pyproject.toml`
-  (except `my-template`), so a newly scaffolded tool joins the cycle without
-  editing the script.
-
-  `fleet_cycle.py --loop` keeps re-running that sequence instead of exiting
-  after one pass — meant for an always-on host, not an interactive session.
-  Each iteration re-derives the usable account pool
-  (`account_usage.select_accounts`, polled on a cadence rather than every
-  iteration) and backs off between iterations that dispatch nothing. It's
-  meant to be launched as a long-lived process (e.g. a systemd user service)
-  with `Restart=on-failure` handling crash recovery, not driven by this
-  script's own `--max-duration-min`/`--max-cycle-budget-usd`, which exist for
-  bounded manual runs instead.
-
-Every mutating side effect along the way — `git push`, `gh pr create`,
-tracking-issue edits — is wrapped as an `Action` routed through `Policy`
-(`my-guard`'s `Guard`, or a tool's own default). An `ASK` collapses to `DENY`
-unattended (in CI, or with no `my-telegram-bot` wired in); with
-`TelegramPolicy` wrapping it, an `ASK` becomes a real Allow/Deny prompt sent
-to Telegram and blocks for a reply instead.
+`gh`-attributed, ledger-recorded action, per every tool's own invariants. The
+external driver that chains them — the pick-and-build dispatch loop, the full
+build/study cycle, the cross-repo test gate, ASK-channel merge routing, and
+usage/account monitoring — lives in its own repo,
+[**my-fleet**](https://github.com/MyThingsLab/my-fleet), not at this root.
+See its README for the cycle's step order, the kill switch, and the
+`--ask-human` channel.
 
 ## Issue → PR → draft → ready → green → merge
 
-Every worker's PR follows the same shape (`fleet_dispatch.py`'s
+Every worker's PR follows the same shape (`my-fleet`'s `fleet_dispatch`
 `_finalize_pr`): open **draft**, promote to **ready for review** only once
 the PR body's readiness checklist holds *and* CI is green, and never merge —
 a human always does that last step.
@@ -94,82 +57,6 @@ one empty `Initial commit` every new tool pushes straight to `main` before
 its first PR exists). So even a manual push or a misbehaving tool can't
 land on `main` without going through the same gate the fleet already
 enforces on itself.
-
-```bash
-# One full cycle, dry-run (default): reports what each step would do, no
-# mutating subcommands run and fleet_dispatch never spawns billed sessions.
-python3 fleet_cycle.py --accounts ~/.claude-lorenzoliuzzo,~/.claude-mythingslab
-
-# For real: mutating subcommands run, and fleet_dispatch spawns real sessions.
-python3 fleet_cycle.py --accounts ~/.claude-lorenzoliuzzo,~/.claude-mythingslab \
-  --execute --dispatch-execute
-```
-
-`--execute` and `--dispatch-execute` are separate flags on purpose:
-`fleet_dispatch`'s sessions are billed API usage, while the rest of the cycle
-(tester/changelogger/projector/reporter/telegram) is not — you can run the
-bookkeeping half of the loop freely and opt into spawning workers separately.
-
-Spawning real sessions also requires an identity choice: authenticate as the
-permission-scoped GitHub App (`--app-id`/`--app-installation-id`/
-`--app-private-key` on `fleet_dispatch.py`), or pass `--allow-personal-token`
-(both drivers) to explicitly accept running workers on the ambient personal
-`gh` token — which is scoped to every repo the account can write to, not just
-this org, so it is never the silent default.
-
-## Asking a human (`--ask-human`)
-
-MyGuard answers `ASK` when an action needs a human's blessing. Unattended there
-was nobody to ask, so every caller's `PolicyResult.under(unattended=True)`
-collapsed it to `DENY` — correct, but the human was *never actually asked*, and
-MyTelegramBot's whole reason for existing (turning an `ASK` into a real Allow/Deny
-prompt) sat unplugged with zero callers.
-
-`--ask-human` on either driver arms the channel:
-
-```bash
-python3 fleet_cycle.py --accounts ... --execute --ask-human
-python3 fleet_dispatch.py --accounts ... --execute --ask-human
-```
-
-It exports `MYTHINGS_ASK_CMD`, which every tool CLI and headless worker inherits,
-so a bare `Guard()` anywhere in the fleet escalates its `ASK`s to Telegram and
-honours the tap. **Exit 0 is the human's ALLOW; anything else — deny, timeout,
-crash — is a `DENY`.** Fail-closed throughout; unset the variable and behavior is
-exactly what it was.
-
-Two things that fail *silently* if you get them wrong, so the driver refuses
-rather than let you:
-
-- **The ledger is the rendezvous.** `mytelegrambot ask` blocks on a `kind=callback`
-  entry that the *daemon* writes. Its `--ledger` default is cwd-relative, and a
-  worker runs in a git worktree — so the default would point at a ledger nobody
-  writes to and every prompt would time out into a `DENY`. `--ask-human` always
-  passes the daemon's absolute path.
-- **The daemon must be running.** Wired to a dead daemon, every `ASK` blocks for
-  the full timeout and *then* denies: slower than no channel and just as closed.
-  The driver preflights for a live `mytelegrambot run` and refuses to start
-  without one. Pass `--ask-remote-daemon` if it runs on another host sharing the
-  ledger (the Pi), and `--ask-timeout` to tune the per-ask wait (default 300s).
-
-## Kill switch
-
-To stop `fleet_dispatch.py --execute` from launching anything — right now,
-across every account, until you say otherwise:
-
-```bash
-python3 fleet_dispatch.py --abort        # arm it: no --accounts needed
-python3 fleet_dispatch.py --clear-halt   # disarm it once it's safe to resume
-```
-
-`--abort` touches a marker file (`.fleet-dispatch/HALT`); every `--execute` run
-checks for it before launching a single session and refuses outright if it's
-there (a dry run still reports normally, just with a note). Since `fleet_cycle.py`
-shells out to `fleet_dispatch.py` for its dispatch step, arming the marker halts
-that path too. It doesn't reach into a session already running — those are
-already bounded by `--max-budget-usd`/`--max-turns` and end on their own — it
-stops the *next* one, so running `--abort` mid-flight leaves no half-written
-state to clean up: whatever already pushed stays pushed, and nothing new starts.
 
 ## Provenance
 

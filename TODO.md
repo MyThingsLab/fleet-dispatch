@@ -1,6 +1,8 @@
 # TODO — MyThingsLab
 
-_Curated by **my-todo** from open issues._
+_Curated by **my-todo** from open issues._ `fleet-dispatch#N` issue refs below
+live in this root repo (still named `fleet-dispatch` on GitHub) even though
+its scripts moved to [my-fleet](https://github.com/MyThingsLab/my-fleet).
 
 ## Now
 - [ ] fleet-dispatch#6 safety: add dependency-vulnerability scanning across the fleet `safety`
