@@ -15,6 +15,8 @@ what the whole fleet did until now.
 from __future__ import annotations
 
 import os
+import shutil
+import sys
 from pathlib import Path
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
@@ -37,13 +39,40 @@ BOT_LEDGER = WORKSPACE_ROOT / "my-telegram-bot" / ".mythings" / "ledger.jsonl"
 # as a backstop for an `ask` that fails to honour its own deadline.
 DEFAULT_ASK_TIMEOUT = 300
 
+# What `mytelegrambot ask` reads from the environment at startup. Never logged, never
+# written anywhere -- only their presence is ever checked.
+TELEGRAM_CREDENTIALS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+
 
 class AskChannelUnavailable(RuntimeError):
     pass
 
 
-def ask_command(*, ledger: Path = BOT_LEDGER, timeout: int = DEFAULT_ASK_TIMEOUT) -> str:
-    return f"mytelegrambot ask --ledger {ledger} --timeout {timeout}"
+def ask_binary() -> Path | None:
+    # Resolve `mytelegrambot` to an absolute path rather than trusting PATH.
+    #
+    # It is a venv console script, and a subprocess does not necessarily inherit a
+    # PATH containing that venv's bin -- on the Pi it does not, because the caller
+    # is invoked as `.venv/bin/python3 script.py` without the venv ever being
+    # activated. A bare `mytelegrambot` there raises FileNotFoundError, MyGuard
+    # dutifully treats that as a DENY, and every merge is silently refused by a
+    # channel that never reached anyone. Fail-closed, but for the wrong reason and
+    # with no human ever asked.
+    #
+    # The interpreter running us is the ground truth: the console script sits beside
+    # it in the same bin/.
+    beside_interpreter = Path(sys.executable).parent / "mytelegrambot"
+    if beside_interpreter.exists():
+        return beside_interpreter
+    found = shutil.which("mytelegrambot")
+    return Path(found) if found else None
+
+
+def ask_command(
+    *, ledger: Path = BOT_LEDGER, timeout: int = DEFAULT_ASK_TIMEOUT
+) -> str:
+    binary = ask_binary() or Path("mytelegrambot")
+    return f"{binary} ask --ledger {ledger} --timeout {timeout}"
 
 
 def daemon_is_running() -> bool:
@@ -84,7 +113,9 @@ def daemon_is_running() -> bool:
     return False
 
 
-def ask_env(*, ledger: Path = BOT_LEDGER, timeout: int = DEFAULT_ASK_TIMEOUT) -> dict[str, str]:
+def ask_env(
+    *, ledger: Path = BOT_LEDGER, timeout: int = DEFAULT_ASK_TIMEOUT
+) -> dict[str, str]:
     return {
         "MYTHINGS_ASK_CMD": ask_command(ledger=ledger, timeout=timeout),
         # Guard's backstop, above `ask`'s own deadline so the inner timeout is the
@@ -110,6 +141,35 @@ def enable(
     # nothing in the output to say why. Better to stop here than to spend an hour
     # denying everything.
     env = os.environ if env is None else env
+
+    # Every precondition below has the same failure mode, and it is a nasty one: the
+    # ask subprocess dies, MyGuard reads any non-zero exit as a DENY, and the caller
+    # logs "not approved" -- indistinguishable from a human tapping Deny. The action
+    # is refused by a channel that never reached anyone, and nothing says so. Each of
+    # these was found the hard way, in this order, against the real daemon. Check them
+    # up front and refuse loudly instead.
+    if ask_binary() is None:
+        raise AskChannelUnavailable(
+            "`mytelegrambot` is not runnable from here.\n"
+            "  Every ask would raise FileNotFoundError, which MyGuard reads as a DENY --\n"
+            "  so every action would be refused by a channel that never reached anyone.\n"
+            "  Install my-telegram-bot into this interpreter's environment, or put its\n"
+            "  console script on PATH."
+        )
+
+    missing = [name for name in TELEGRAM_CREDENTIALS if not env.get(name)]
+    if missing:
+        # The daemon gets these from systemd's EnvironmentFile; a script run by hand
+        # does not inherit them, and `mytelegrambot ask` dies on os.environ[...] with
+        # a KeyError before it ever reaches Telegram.
+        raise AskChannelUnavailable(
+            f"{' and '.join(missing)} not set in this environment.\n"
+            "  `mytelegrambot ask` reads them at startup and would die before reaching\n"
+            "  Telegram -- and MyGuard would read that as a DENY, so every action would\n"
+            "  be refused without anyone ever being asked.\n"
+            "  Source the bot's env file first (the same one the systemd unit uses):\n"
+            "    set -a; . ~/.config/mythingslab/telegram.env; set +a"
+        )
 
     if not ledger.parent.exists():
         raise AskChannelUnavailable(

@@ -33,8 +33,11 @@ jobs:
           # --no-deps: its only dep is the core installed above, but its main
           # still names it "mythings-core" (pre-rename) which pip can't resolve.
           pip install --no-deps "my-orchestrator @ git+https://github.com/${{ github.repository_owner }}/my-orchestrator@main"
+          # merge_ready_prs.py routes every merge through MyGuard's pr-merge ASK
+          # rule, so the guard is a real dependency of this repo's scripts now.
+          pip install --no-deps "my-guard @ git+https://github.com/${{ github.repository_owner }}/my-guard@main"
           pip install pytest ruff
       - name: Ruff
-        run: ruff check fleet_ask.py fleet_dispatch.py fleet_cycle.py fleet_usage.py account_usage.py cycle_driver.py study_cycle.py test_fleet_ask.py test_fleet_dispatch.py test_fleet_cycle.py test_account_usage.py test_cycle_driver.py test_study_cycle.py
+        run: ruff check merge_ready_prs.py fleet_ask.py fleet_dispatch.py fleet_cycle.py fleet_usage.py account_usage.py cycle_driver.py study_cycle.py test_merge_ready_prs.py test_fleet_ask.py test_fleet_dispatch.py test_fleet_cycle.py test_account_usage.py test_cycle_driver.py test_study_cycle.py
       - name: Tests
-        run: pytest test_fleet_ask.py test_fleet_dispatch.py test_fleet_cycle.py test_account_usage.py test_cycle_driver.py test_study_cycle.py
+        run: pytest test_merge_ready_prs.py test_fleet_ask.py test_fleet_dispatch.py test_fleet_cycle.py test_account_usage.py test_cycle_driver.py test_study_cycle.py

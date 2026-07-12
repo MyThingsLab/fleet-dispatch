@@ -6,6 +6,8 @@ import pytest
 
 import fleet_ask
 
+_CREDS = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
+
 # The wire between MyGuard's escalation seam and `mytelegrambot ask`. Two things
 # it must get right, both of which fail *silently* when wrong:
 #
@@ -32,7 +34,11 @@ def test_the_ask_command_points_at_the_ledger_the_daemon_actually_writes() -> No
     # The systemd unit sets WorkingDirectory to the bot's repo and `mytelegrambot
     # run` resolves .mythings/ledger.jsonl relative to it. If this drifts, the
     # rendezvous breaks and every ASK denies.
-    assert fleet_ask.BOT_LEDGER.parts[-3:] == ("my-telegram-bot", ".mythings", "ledger.jsonl")
+    assert fleet_ask.BOT_LEDGER.parts[-3:] == (
+        "my-telegram-bot",
+        ".mythings",
+        "ledger.jsonl",
+    )
 
 
 def test_guards_backstop_timeout_sits_above_asks_own_deadline() -> None:
@@ -53,25 +59,31 @@ def test_enable_refuses_when_no_daemon_is_running(
     # with nothing in the output explaining why. Refusing loudly beats that.
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: False)
-    env: dict[str, str] = {}
+    env: dict[str, str] = dict(_CREDS)
 
-    with pytest.raises(fleet_ask.AskChannelUnavailable, match="no `mytelegrambot run` daemon"):
+    with pytest.raises(
+        fleet_ask.AskChannelUnavailable, match="no `mytelegrambot run` daemon"
+    ):
         fleet_ask.enable(ledger=ledger, env=env)
 
-    assert env == {}  # nothing armed
+    assert "MYTHINGS_ASK_CMD" not in env  # nothing armed
 
 
 def test_enable_refuses_when_the_ledger_directory_does_not_exist(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
-    env: dict[str, str] = {}
+    env: dict[str, str] = dict(_CREDS)
 
-    with pytest.raises(fleet_ask.AskChannelUnavailable, match="ledger directory does not exist"):
+    with pytest.raises(
+        fleet_ask.AskChannelUnavailable, match="ledger directory does not exist"
+    ):
         fleet_ask.enable(ledger=tmp_path / "nope" / "ledger.jsonl", env=env)
 
-    assert env == {}
+    assert "MYTHINGS_ASK_CMD" not in env
 
 
 def test_a_remote_daemon_skips_the_local_process_check(
@@ -81,8 +93,9 @@ def test_a_remote_daemon_skips_the_local_process_check(
     # still wants the channel. The local process table proves nothing there.
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: False)
-    env: dict[str, str] = {}
+    env: dict[str, str] = dict(_CREDS)
 
     wiring = fleet_ask.enable(ledger=ledger, env=env, remote_daemon=True)
 
@@ -98,12 +111,15 @@ def test_enable_arms_the_env_every_subprocess_inherits(
     # MyGuard reads the channel from the env rather than from an argument.
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
-    env: dict[str, str] = {}
+    env: dict[str, str] = dict(_CREDS)
 
     fleet_ask.enable(ledger=ledger, timeout=45, env=env)
 
-    assert env["MYTHINGS_ASK_CMD"].startswith("mytelegrambot ask --ledger ")
+    # Absolute, not a bare name: a subprocess may not inherit the venv on PATH.
+    assert " ask --ledger " in env["MYTHINGS_ASK_CMD"]
+    assert env["MYTHINGS_ASK_CMD"].startswith("/")
     assert "--timeout 45" in env["MYTHINGS_ASK_CMD"]
     assert env["MYTHINGS_ASK_TIMEOUT"] == "75"
 
@@ -154,3 +170,78 @@ def test_the_daemon_check_finds_the_real_console_script_form(tmp_path: Path) -> 
     finally:
         proc.terminate()
         proc.wait()
+
+
+def test_the_ask_command_names_the_binary_absolutely_not_by_bare_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The bug this pins, found on the Pi against the real daemon: `mytelegrambot` is
+    # a venv console script, and a subprocess does not necessarily inherit a PATH
+    # containing that venv's bin. A bare name raised FileNotFoundError, MyGuard read
+    # that as a DENY, and every merge was silently refused by a channel that had
+    # never reached anyone -- fail-closed, but for the wrong reason, with no human
+    # ever asked.
+    # my-telegram-bot is not installed in every environment that runs these tests
+    # (fleet-dispatch's CI installs only core/guard/orchestrator), so stub the
+    # resolution rather than depend on it.
+    binary = tmp_path / "bin" / "mytelegrambot"
+    binary.parent.mkdir()
+    binary.touch()
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: binary)
+
+    command = fleet_ask.ask_command()
+
+    assert command.startswith("/"), command  # absolute, never a bare name
+    assert Path(command.split()[0]).name == "mytelegrambot"
+
+
+def test_enable_refuses_when_the_ask_binary_cannot_be_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ledger = tmp_path / ".mythings" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: None)
+    env: dict[str, str] = {}
+
+    with pytest.raises(fleet_ask.AskChannelUnavailable, match="not runnable"):
+        fleet_ask.enable(ledger=ledger, env=env)
+
+    assert "MYTHINGS_ASK_CMD" not in env  # nothing armed
+
+
+def test_enable_refuses_when_the_bot_credentials_are_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The third way a channel can be broken while looking like a human deny, and the
+    # one that actually bit on the Pi: the daemon gets TELEGRAM_BOT_TOKEN from
+    # systemd's EnvironmentFile, but a script run by hand does not inherit it. `ask`
+    # dies on os.environ[...] with a KeyError before reaching Telegram, MyGuard reads
+    # the non-zero exit as DENY, and three PRs were logged "not approved" as though a
+    # human had refused them.
+    ledger = tmp_path / ".mythings" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
+    monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
+    env = {"TELEGRAM_CHAT_ID": "chat"}  # token missing
+
+    with pytest.raises(fleet_ask.AskChannelUnavailable, match="TELEGRAM_BOT_TOKEN"):
+        fleet_ask.enable(ledger=ledger, env=env)
+
+    assert "MYTHINGS_ASK_CMD" not in env  # nothing armed
+
+
+def test_the_refusal_never_echoes_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A secret must not end up in a log line just because a preflight failed.
+    ledger = tmp_path / ".mythings" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
+    monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
+    env = {"TELEGRAM_BOT_TOKEN": "super-secret-token"}  # chat id missing
+
+    with pytest.raises(fleet_ask.AskChannelUnavailable) as caught:
+        fleet_ask.enable(ledger=ledger, env=env)
+
+    assert "super-secret-token" not in str(caught.value)
