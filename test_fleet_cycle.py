@@ -132,6 +132,28 @@ def test_main_skips_mydashboard_when_docs_site_clone_missing(
     assert "skipping mydashboard" in capsys.readouterr().out
 
 
+def test_main_forwards_allow_personal_token_to_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _capture_runs(monkeypatch)
+    fc.main([
+        "--accounts", "/tmp/acct",
+        "--dispatch-execute", "--allow-personal-token", "--brief-count", "0",
+    ])
+    (dispatch_cmd,) = [cmd for cmd, _ in calls if any("fleet_dispatch.py" in c for c in cmd)]
+    assert "--allow-personal-token" in dispatch_cmd
+    assert "--execute" in dispatch_cmd
+
+
+def test_main_does_not_forward_allow_personal_token_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _capture_runs(monkeypatch)
+    fc.main(["--accounts", "/tmp/acct", "--brief-count", "0"])
+    (dispatch_cmd,) = [cmd for cmd, _ in calls if any("fleet_dispatch.py" in c for c in cmd)]
+    assert "--allow-personal-token" not in dispatch_cmd
+
+
 def test_execute_cycle_refuses_when_halt_marker_present(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

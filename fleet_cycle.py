@@ -175,6 +175,8 @@ def _run_cycle(args: argparse.Namespace, *, accounts: str, skip_dispatch: bool, 
         dispatch_cmd = [py, str(WORKSPACE_ROOT / "fleet_dispatch.py"), "--accounts", accounts]
         if args.dispatch_execute:
             dispatch_cmd.append("--execute")
+        if args.allow_personal_token:
+            dispatch_cmd.append("--allow-personal-token")
         _run(dispatch_cmd)
 
     # 3. MyResearcher: brief a bounded number of open study topic issues.
@@ -413,6 +415,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dispatch-execute", action="store_true", help="also let fleet_dispatch spawn real headless sessions (separate from --execute since it's billed)")
     parser.add_argument("--engine", choices=["noop", "claude-cli"], default="noop", help="Engine backend for planner/tester/projector/reporter")
     parser.add_argument("--skip-dispatch", action="store_true", help="skip step 2 (fleet_dispatch); --loop: applies to every iteration")
+    parser.add_argument(
+        "--allow-personal-token",
+        action="store_true",
+        help="forwarded to fleet_dispatch.py: explicitly accept spawning workers "
+        "on the ambient personal gh token instead of the GitHub App (see "
+        "fleet_dispatch.py --help for why this is opt-in)",
+    )
     parser.add_argument(
         "--ask-human",
         action="store_true",

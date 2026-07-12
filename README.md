@@ -110,6 +110,13 @@ python3 fleet_cycle.py --accounts ~/.claude-lorenzoliuzzo,~/.claude-mythingslab 
 (tester/changelogger/projector/reporter/telegram) is not — you can run the
 bookkeeping half of the loop freely and opt into spawning workers separately.
 
+Spawning real sessions also requires an identity choice: authenticate as the
+permission-scoped GitHub App (`--app-id`/`--app-installation-id`/
+`--app-private-key` on `fleet_dispatch.py`), or pass `--allow-personal-token`
+(both drivers) to explicitly accept running workers on the ambient personal
+`gh` token — which is scoped to every repo the account can write to, not just
+this org, so it is never the silent default.
+
 ## Asking a human (`--ask-human`)
 
 MyGuard answers `ASK` when an action needs a human's blessing. Unattended there

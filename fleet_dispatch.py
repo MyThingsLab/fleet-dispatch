@@ -1137,6 +1137,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--app-private-key", help="path to the GitHub App's private key .pem file (see --app-id)"
     )
+    parser.add_argument(
+        "--allow-personal-token",
+        action="store_true",
+        help="explicitly accept running --execute on the ambient personal gh "
+        "token instead of the GitHub App. The personal token is scoped to every "
+        "repo the account can write to (all ventures, not just this org), so a "
+        "misbehaving worker inherits that whole blast radius -- opting in must "
+        "be a deliberate, visible choice, never the silent default.",
+    )
     args = parser.parse_args(argv)
 
     if args.abort:
@@ -1208,6 +1217,20 @@ def main(argv: list[str] | None = None) -> int:
             f"authenticating as the GitHub App (installation {args.app_installation_id}) "
             f"— the personal PAT is not used for this run"
         )
+
+    # Identity gate: spawning workers on the ambient personal token hands every
+    # session credentials for every repo the human can write to. The App path
+    # exists (above); using the PAT anyway must be said out loud, per run.
+    if args.execute and not all(app_flags) and not args.allow_personal_token:
+        print(
+            "refusing to --execute on the ambient personal gh token: every worker "
+            "would inherit credentials for ALL repos this account can write to, "
+            "not just the MyThingsLab org. Authenticate as the permission-scoped "
+            "GitHub App (--app-id/--app-installation-id/--app-private-key), or "
+            "pass --allow-personal-token to accept the wider blast radius for "
+            "this run."
+        )
+        return 1
 
     # A fleet of accounts that are secretly the same account is not a fleet.
     # Always gate on distinct identities -- cheap, local, and it prevents silently
