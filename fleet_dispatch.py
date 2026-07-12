@@ -683,6 +683,28 @@ def _remote_branch_exists(repo_path: Path, branch: str) -> bool:
     return result.returncode == 0
 
 
+def _fresh_base_ref(repo_path: Path) -> str:
+    # A fresh dispatch must base on origin's main, not the local checkout's:
+    # Workspace cuts the worktree from a LOCAL ref, and nothing keeps the
+    # sibling checkouts current between human syncs -- a worker cut from a
+    # stale main re-solves already-merged work and collides on push. A repo
+    # with no reachable origin (offline, or a bare test repo) falls back to
+    # the local main with a note rather than refusing outright: if the
+    # network is really gone the run fails honestly at push time anyway.
+    fetch = subprocess.run(
+        ["git", "-C", str(repo_path), "fetch", "origin", "main"],
+        capture_output=True,
+        text=True,
+    )
+    if fetch.returncode == 0:
+        return "origin/main"
+    print(
+        f"  (git fetch origin main failed in {repo_path.name}; basing on local main: "
+        f"{fetch.stderr.strip()[:120]})"
+    )
+    return "main"
+
+
 def _record_usage(
     report: UsageReport, *, account: Account, candidate: Candidate, transcript_path: Path,
     ledger: Ledger, rtk: bool = False,
@@ -785,7 +807,7 @@ def _dispatch_one(
     # attempt left nothing durable (no_changes/transient failure never pushed),
     # fall back to main but still carry its context in the prompt.
     resuming_branch = prior is not None and _remote_branch_exists(repo_path, branch)
-    base_ref = f"origin/{branch}" if resuming_branch else "main"
+    base_ref = f"origin/{branch}" if resuming_branch else "origin/main"
     prompt = _prompt_for(candidate, prior, has_branch=resuming_branch)
 
     mode = "fresh" if prior is None else f"resume#{attempt_number} from {prior.outcome}"
@@ -821,9 +843,15 @@ def _dispatch_one(
         allowed_tools = _with_rtk_allowlist(allowed_tools)
 
     if resuming_branch:
+        # Fetch main alongside the branch: the merge-base below measures the
+        # branch's own commits against origin's mainline, and a stale local
+        # main would count already-merged commits as the worker's.
         subprocess.run(
-            ["git", "-C", str(repo_path), "fetch", "origin", branch], check=True
+            ["git", "-C", str(repo_path), "fetch", "origin", "main", branch], check=True
         )
+        mainline = "origin/main"
+    else:
+        base_ref = mainline = _fresh_base_ref(repo_path)
 
     with Workspace(repo_path, base_ref=base_ref) as tree:
         # -B, not -b: reset the local branch ref to this worktree's HEAD (the
@@ -916,7 +944,7 @@ def _dispatch_one(
         # exists on the branch at all; count this run's additions separately so
         # a resume that made no progress is visible.
         merge_base = subprocess.run(
-            ["git", "-C", str(tree), "merge-base", "main", "HEAD"],
+            ["git", "-C", str(tree), "merge-base", mainline, "HEAD"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
         total_commits = int(

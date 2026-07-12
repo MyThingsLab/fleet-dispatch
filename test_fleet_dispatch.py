@@ -992,6 +992,90 @@ def test_dispatch_one_passes_max_turns_and_max_budget_to_claude(tmp_path: Path, 
     assert argv[argv.index("--max-budget-usd") + 1] == "1.5"
 
 
+def test_dispatch_one_bases_fresh_worktree_on_origin_main(tmp_path: Path, monkeypatch) -> None:
+    # The local checkout deliberately lags origin: a fresh dispatch must cut
+    # its worktree from origin's main (fetched), not the stale local one.
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    _init_git_repo(repo_path)
+    subprocess.run(["git", "-C", str(repo_path), "branch", "-M", "main"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo_path), "remote", "add", "origin", str(origin)], check=True
+    )
+    subprocess.run(["git", "-C", str(repo_path), "push", "-q", "origin", "main"], check=True)
+
+    # Advance origin past the local checkout via a second clone.
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", str(origin), str(other)], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(other), "config", "user.name", "t"], check=True)
+    (other / "newer").write_text("newer")
+    subprocess.run(["git", "-C", str(other), "add", "newer"], check=True)
+    subprocess.run(["git", "-C", str(other), "commit", "-qm", "newer on origin"], check=True)
+    subprocess.run(["git", "-C", str(other), "push", "-q", "origin", "main"], check=True)
+
+    monkeypatch.setattr(fd, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(fd, "TRANSCRIPTS_DIR", tmp_path / "transcripts")
+    monkeypatch.setattr(fd, "_open_pr_number", lambda *a, **k: None)
+
+    seen: dict = {}
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            tree = kwargs["cwd"]
+            seen["has_newer"] = (Path(tree) / "newer").exists()
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    candidate = fd.Candidate(
+        id="repo#1", repo="repo", tool="", title="t", kind="issue", created_at="2020-01-01"
+    )
+    fd._dispatch_one(
+        _account(tmp_path / "cfg", {}),
+        candidate,
+        execute=True,
+        max_budget_usd=1.0,
+        max_turns=5,
+        ledger=Ledger(tmp_path / "ledger.jsonl"),
+        org="MyThingsLab",
+    )
+
+    assert seen["has_newer"] is True
+
+
+def test_dispatch_one_falls_back_to_local_main_without_origin(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    candidate, account, ledger = _setup_dispatch_one_repo(tmp_path, monkeypatch)
+
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    fd._dispatch_one(
+        account,
+        candidate,
+        execute=True,
+        max_budget_usd=1.0,
+        max_turns=5,
+        ledger=ledger,
+        org="MyThingsLab",
+    )
+
+    assert "basing on local main" in capsys.readouterr().out
+
+
 def test_redact_secrets_removes_full_token_and_names_pattern() -> None:
     # Planted token built by concatenation so this source line never trips a
     # diff-based secret scan itself.
