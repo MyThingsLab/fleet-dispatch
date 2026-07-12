@@ -137,7 +137,7 @@ def test_the_ask_ledger_can_be_pointed_at_the_daemons_own_file(
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
-    env: dict[str, str] = {}
+    env: dict[str, str] = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
 
     fleet_ask.enable(ledger=ledger, env=env)
 
@@ -155,6 +155,8 @@ def test_the_ask_path_actually_parses_and_runs(
 
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
     monkeypatch.setattr(merge_ready_prs, "list_org_repos", lambda org: ["my-idea"])
     monkeypatch.setattr(merge_ready_prs, "list_open_prs", lambda repo: [_pr(7)])

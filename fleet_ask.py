@@ -39,6 +39,10 @@ BOT_LEDGER = WORKSPACE_ROOT / "my-telegram-bot" / ".mythings" / "ledger.jsonl"
 # as a backstop for an `ask` that fails to honour its own deadline.
 DEFAULT_ASK_TIMEOUT = 300
 
+# What `mytelegrambot ask` reads from the environment at startup. Never logged, never
+# written anywhere -- only their presence is ever checked.
+TELEGRAM_CREDENTIALS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+
 
 class AskChannelUnavailable(RuntimeError):
     pass
@@ -138,6 +142,12 @@ def enable(
     # denying everything.
     env = os.environ if env is None else env
 
+    # Every precondition below has the same failure mode, and it is a nasty one: the
+    # ask subprocess dies, MyGuard reads any non-zero exit as a DENY, and the caller
+    # logs "not approved" -- indistinguishable from a human tapping Deny. The action
+    # is refused by a channel that never reached anyone, and nothing says so. Each of
+    # these was found the hard way, in this order, against the real daemon. Check them
+    # up front and refuse loudly instead.
     if ask_binary() is None:
         raise AskChannelUnavailable(
             "`mytelegrambot` is not runnable from here.\n"
@@ -145,6 +155,20 @@ def enable(
             "  so every action would be refused by a channel that never reached anyone.\n"
             "  Install my-telegram-bot into this interpreter's environment, or put its\n"
             "  console script on PATH."
+        )
+
+    missing = [name for name in TELEGRAM_CREDENTIALS if not env.get(name)]
+    if missing:
+        # The daemon gets these from systemd's EnvironmentFile; a script run by hand
+        # does not inherit them, and `mytelegrambot ask` dies on os.environ[...] with
+        # a KeyError before it ever reaches Telegram.
+        raise AskChannelUnavailable(
+            f"{' and '.join(missing)} not set in this environment.\n"
+            "  `mytelegrambot ask` reads them at startup and would die before reaching\n"
+            "  Telegram -- and MyGuard would read that as a DENY, so every action would\n"
+            "  be refused without anyone ever being asked.\n"
+            "  Source the bot's env file first (the same one the systemd unit uses):\n"
+            "    set -a; . ~/.config/mythingslab/telegram.env; set +a"
         )
 
     if not ledger.parent.exists():

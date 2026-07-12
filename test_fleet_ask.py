@@ -6,6 +6,8 @@ import pytest
 
 import fleet_ask
 
+_CREDS = {"TELEGRAM_BOT_TOKEN": "t", "TELEGRAM_CHAT_ID": "c"}
+
 # The wire between MyGuard's escalation seam and `mytelegrambot ask`. Two things
 # it must get right, both of which fail *silently* when wrong:
 #
@@ -58,28 +60,28 @@ def test_enable_refuses_when_no_daemon_is_running(
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: False)
-    env: dict[str, str] = {}
+    env: dict[str, str] = dict(_CREDS)
 
     with pytest.raises(
         fleet_ask.AskChannelUnavailable, match="no `mytelegrambot run` daemon"
     ):
         fleet_ask.enable(ledger=ledger, env=env)
 
-    assert env == {}  # nothing armed
+    assert "MYTHINGS_ASK_CMD" not in env  # nothing armed
 
 
 def test_enable_refuses_when_the_ledger_directory_does_not_exist(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
-    env: dict[str, str] = {}
+    env: dict[str, str] = dict(_CREDS)
 
     with pytest.raises(
         fleet_ask.AskChannelUnavailable, match="ledger directory does not exist"
     ):
         fleet_ask.enable(ledger=tmp_path / "nope" / "ledger.jsonl", env=env)
 
-    assert env == {}
+    assert "MYTHINGS_ASK_CMD" not in env
 
 
 def test_a_remote_daemon_skips_the_local_process_check(
@@ -90,7 +92,7 @@ def test_a_remote_daemon_skips_the_local_process_check(
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: False)
-    env: dict[str, str] = {}
+    env: dict[str, str] = dict(_CREDS)
 
     wiring = fleet_ask.enable(ledger=ledger, env=env, remote_daemon=True)
 
@@ -107,7 +109,7 @@ def test_enable_arms_the_env_every_subprocess_inherits(
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
-    env: dict[str, str] = {}
+    env: dict[str, str] = dict(_CREDS)
 
     fleet_ask.enable(ledger=ledger, timeout=45, env=env)
 
@@ -191,4 +193,39 @@ def test_enable_refuses_when_the_ask_binary_cannot_be_run(
     with pytest.raises(fleet_ask.AskChannelUnavailable, match="not runnable"):
         fleet_ask.enable(ledger=ledger, env=env)
 
-    assert env == {}  # nothing armed
+    assert "MYTHINGS_ASK_CMD" not in env  # nothing armed
+
+
+def test_enable_refuses_when_the_bot_credentials_are_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The third way a channel can be broken while looking like a human deny, and the
+    # one that actually bit on the Pi: the daemon gets TELEGRAM_BOT_TOKEN from
+    # systemd's EnvironmentFile, but a script run by hand does not inherit it. `ask`
+    # dies on os.environ[...] with a KeyError before reaching Telegram, MyGuard reads
+    # the non-zero exit as DENY, and three PRs were logged "not approved" as though a
+    # human had refused them.
+    ledger = tmp_path / ".mythings" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
+    env = {"TELEGRAM_CHAT_ID": "chat"}  # token missing
+
+    with pytest.raises(fleet_ask.AskChannelUnavailable, match="TELEGRAM_BOT_TOKEN"):
+        fleet_ask.enable(ledger=ledger, env=env)
+
+    assert "MYTHINGS_ASK_CMD" not in env  # nothing armed
+
+
+def test_the_refusal_never_echoes_the_token(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A secret must not end up in a log line just because a preflight failed.
+    ledger = tmp_path / ".mythings" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
+    env = {"TELEGRAM_BOT_TOKEN": "super-secret-token"}  # chat id missing
+
+    with pytest.raises(fleet_ask.AskChannelUnavailable) as caught:
+        fleet_ask.enable(ledger=ledger, env=env)
+
+    assert "super-secret-token" not in str(caught.value)
