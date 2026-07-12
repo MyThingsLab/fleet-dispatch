@@ -22,11 +22,9 @@ dry-run by default).
 from __future__ import annotations
 
 import base64
-import json
 import re
 import subprocess
 import sys
-from dataclasses import dataclass
 
 from merge_ready_prs import PR, list_open_prs, list_org_repos
 
