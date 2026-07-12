@@ -45,3 +45,8 @@ Canonical homes: the harness lives at `my-things-core/src/mythings/harness.md`
 - **Re-check live state before acting.** An external multi-worker dispatcher
   runs against these same repos; issues, PRs, and branches move between
   sessions. `git fetch` and check `gh` before trusting a local checkout.
+- **Read a file before editing it, every session.** The Edit/Write tools
+  require a prior Read in the *current* session — a file existing on disk
+  from an earlier session or worker doesn't satisfy this. Fresh worker
+  sessions and post-compaction context both need a fresh Read before any
+  Edit/Write, even for files you already know the contents of.
