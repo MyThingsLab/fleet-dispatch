@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from myguard import Guard
 from myguard.rules import MERGE_ACTION
@@ -235,6 +236,15 @@ def main(argv: list[str] | None = None) -> int:
         "--ask-remote-daemon",
         action="store_true",
         help="the daemon runs on another host sharing this ledger",
+    )
+    parser.add_argument(
+        "--ask-ledger",
+        type=Path,
+        default=fleet_ask.BOT_LEDGER,
+        help="the ledger the mytelegrambot daemon writes taps to. `ask` and the daemon "
+        "rendezvous through this file and nothing else, so it must be the daemon's own. "
+        "The default is derived relative to this script, which is only correct when this "
+        "repo is the workspace root -- it is not on every host (default: %(default)s)",
     )
     parser.add_argument(
         "--repo",

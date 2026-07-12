@@ -35,7 +35,9 @@ class _Guard:
         from mythings.policy import PolicyResult
 
         self.asked.append(f"{action.payload['repo']}#{action.payload['number']}")
-        return PolicyResult(self.decisions.pop(0), reason="human", rule="merge_needs_a_human")
+        return PolicyResult(
+            self.decisions.pop(0), reason="human", rule="merge_needs_a_human"
+        )
 
 
 @pytest.fixture
@@ -113,7 +115,9 @@ def test_a_merge_that_fails_after_approval_does_not_strand_the_rest(
 
     monkeypatch.setattr(merge_ready_prs, "merge", flaky)
 
-    code = merge_by_asking([_pr(1), _pr(2)], _Guard(Decision.ALLOW, Decision.ALLOW), budget_s=60)
+    code = merge_by_asking(
+        [_pr(1), _pr(2)], _Guard(Decision.ALLOW, Decision.ALLOW), budget_s=60
+    )
 
     assert done == ["my-idea#2"]  # one stuck PR must not strand the queue
     assert code == 1  # but the run is honest about having failed
@@ -138,3 +142,44 @@ def test_the_ask_ledger_can_be_pointed_at_the_daemons_own_file(
     fleet_ask.enable(ledger=ledger, env=env)
 
     assert str(ledger) in env["MYTHINGS_ASK_CMD"]
+
+
+def test_the_ask_path_actually_parses_and_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, capsys
+) -> None:
+    # The gap this closes: every other test calls merge_by_asking() directly, so
+    # main()'s --ask branch was never executed. It referenced args.ask_ledger while
+    # the flag itself was missing -- an AttributeError on every real run, and CI was
+    # perfectly green. Drive main() so the wiring is exercised, not just the pieces.
+    import fleet_ask
+
+    ledger = tmp_path / ".mythings" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
+    monkeypatch.setattr(merge_ready_prs, "list_org_repos", lambda org: ["my-idea"])
+    monkeypatch.setattr(merge_ready_prs, "list_open_prs", lambda repo: [_pr(7)])
+    monkeypatch.setattr(merge_ready_prs, "merge", lambda pr, **kw: None)
+    # The human taps Deny, so nothing merges and no gh call is needed.
+    monkeypatch.setattr(merge_ready_prs, "approve", lambda pr, guard: Decision.DENY)
+
+    code = merge_ready_prs.main(
+        ["--ask", "--ask-ledger", str(ledger), "--ask-budget-min", "1"]
+    )
+
+    assert code == 0
+    assert str(ledger) in capsys.readouterr().out  # it armed the channel we named
+
+
+def test_the_ask_path_refuses_when_the_daemon_is_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import fleet_ask
+
+    ledger = tmp_path / ".mythings" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: False)
+    monkeypatch.setattr(merge_ready_prs, "list_org_repos", lambda org: ["my-idea"])
+    monkeypatch.setattr(merge_ready_prs, "list_open_prs", lambda repo: [_pr(7)])
+
+    # Nobody would see the tap, so every merge would time out and deny. Refuse.
+    assert merge_ready_prs.main(["--ask", "--ask-ledger", str(ledger)]) == 2
