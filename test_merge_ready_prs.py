@@ -117,3 +117,24 @@ def test_a_merge_that_fails_after_approval_does_not_strand_the_rest(
 
     assert done == ["my-idea#2"]  # one stuck PR must not strand the queue
     assert code == 1  # but the run is honest about having failed
+
+
+def test_the_ask_ledger_can_be_pointed_at_the_daemons_own_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    # `ask` and the daemon rendezvous through one ledger file and nothing else. The
+    # default is derived relative to this script, which is only correct when this
+    # repo *is* the workspace root -- it is not on the Pi, where the tools live under
+    # ~/repos/MyThingsLab but this repo is checked out elsewhere. Pointing at the
+    # wrong file sends every prompt and sees no tap: every merge would time out and
+    # deny, with nothing to say why.
+    import fleet_ask
+
+    ledger = tmp_path / ".mythings" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
+    env: dict[str, str] = {}
+
+    fleet_ask.enable(ledger=ledger, env=env)
+
+    assert str(ledger) in env["MYTHINGS_ASK_CMD"]

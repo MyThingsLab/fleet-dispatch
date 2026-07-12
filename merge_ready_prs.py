@@ -271,7 +271,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.ask:
         try:
             wiring = fleet_ask.enable(
-                timeout=args.ask_timeout, remote_daemon=args.ask_remote_daemon
+                ledger=args.ask_ledger,
+                timeout=args.ask_timeout,
+                remote_daemon=args.ask_remote_daemon,
             )
         except fleet_ask.AskChannelUnavailable as exc:
             print(f"\ncannot ask: {exc}", file=sys.stderr)
