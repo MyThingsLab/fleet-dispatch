@@ -59,6 +59,7 @@ def test_enable_refuses_when_no_daemon_is_running(
     # with nothing in the output explaining why. Refusing loudly beats that.
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: False)
     env: dict[str, str] = dict(_CREDS)
 
@@ -73,6 +74,7 @@ def test_enable_refuses_when_no_daemon_is_running(
 def test_enable_refuses_when_the_ledger_directory_does_not_exist(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
     env: dict[str, str] = dict(_CREDS)
 
@@ -91,6 +93,7 @@ def test_a_remote_daemon_skips_the_local_process_check(
     # still wants the channel. The local process table proves nothing there.
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: False)
     env: dict[str, str] = dict(_CREDS)
 
@@ -108,6 +111,7 @@ def test_enable_arms_the_env_every_subprocess_inherits(
     # MyGuard reads the channel from the env rather than from an argument.
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
     env: dict[str, str] = dict(_CREDS)
 
@@ -168,16 +172,26 @@ def test_the_daemon_check_finds_the_real_console_script_form(tmp_path: Path) -> 
         proc.wait()
 
 
-def test_the_ask_command_names_the_binary_absolutely_not_by_bare_name() -> None:
+def test_the_ask_command_names_the_binary_absolutely_not_by_bare_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     # The bug this pins, found on the Pi against the real daemon: `mytelegrambot` is
     # a venv console script, and a subprocess does not necessarily inherit a PATH
     # containing that venv's bin. A bare name raised FileNotFoundError, MyGuard read
     # that as a DENY, and every merge was silently refused by a channel that had
     # never reached anyone -- fail-closed, but for the wrong reason, with no human
     # ever asked.
+    # my-telegram-bot is not installed in every environment that runs these tests
+    # (fleet-dispatch's CI installs only core/guard/orchestrator), so stub the
+    # resolution rather than depend on it.
+    binary = tmp_path / "bin" / "mytelegrambot"
+    binary.parent.mkdir()
+    binary.touch()
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: binary)
+
     command = fleet_ask.ask_command()
 
-    assert command.startswith("/"), command  # absolute, resolved from sys.executable
+    assert command.startswith("/"), command  # absolute, never a bare name
     assert Path(command.split()[0]).name == "mytelegrambot"
 
 
@@ -207,6 +221,7 @@ def test_enable_refuses_when_the_bot_credentials_are_missing(
     # human had refused them.
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
     env = {"TELEGRAM_CHAT_ID": "chat"}  # token missing
 
@@ -222,6 +237,7 @@ def test_the_refusal_never_echoes_the_token(
     # A secret must not end up in a log line just because a preflight failed.
     ledger = tmp_path / ".mythings" / "ledger.jsonl"
     ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: Path("/usr/bin/mytelegrambot"))
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
     env = {"TELEGRAM_BOT_TOKEN": "super-secret-token"}  # chat id missing
 
