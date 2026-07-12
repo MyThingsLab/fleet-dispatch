@@ -1,0 +1,1 @@
+{"data":{"files":"tests/","session":"2026-07-12"},"detail":"Mechanical migration to mythings.testing: shared ScriptedEngine/FakeGh/fake_fetch replace local copies; OpenLibrary/Google/Tavily payload tables and the bibliography-issue wiring stay local.","kind":"build","outcome":"success","tool":"claude-code","ts":"2026-07-12T10:09:09Z"}
