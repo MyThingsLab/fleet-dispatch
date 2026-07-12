@@ -902,7 +902,7 @@ def test_main_refuses_to_dispatch_over_daily_cap(tmp_path: Path, monkeypatch) ->
     rc = fd.main(
         [
             "--accounts", str(tmp_path / "a"),
-            "--execute",
+            "--execute", "--allow-personal-token",
             "--max-budget-usd", "3.0",
             "--max-daily-usd", "20.0",
         ]
@@ -990,6 +990,75 @@ def test_dispatch_one_passes_max_turns_and_max_budget_to_claude(tmp_path: Path, 
     argv = captured["argv"]
     assert argv[argv.index("--max-turns") + 1] == "7"
     assert argv[argv.index("--max-budget-usd") + 1] == "1.5"
+
+
+def test_main_execute_refuses_personal_token_without_optin(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(fd, "HALT_MARKER", tmp_path / "HALT")
+
+    def boom_orchestrator(**_kwargs):
+        raise AssertionError("must refuse before ranking anything")
+
+    monkeypatch.setattr(fd, "Orchestrator", boom_orchestrator)
+    monkeypatch.setattr(fd, "_preflight_distinct_accounts", lambda accounts: [])
+
+    rc = fd.main(["--accounts", str(tmp_path / "a"), "--execute"])
+
+    assert rc == 1
+    assert "refusing to --execute on the ambient personal gh token" in capsys.readouterr().out
+
+
+def test_main_execute_proceeds_with_allow_personal_token(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(fd, "HALT_MARKER", tmp_path / "HALT")
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    calls: list = []
+    monkeypatch.setattr(fd, "_dispatch_one", _dispatch_stub(calls))
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a"), "--execute", "--allow-personal-token"])
+
+    assert rc == 0
+    assert len(calls) == 1
+
+
+def test_main_execute_proceeds_with_app_identity(tmp_path: Path, monkeypatch) -> None:
+    # The App IS the sanctioned identity: no extra opt-in needed.
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(fd, "HALT_MARKER", tmp_path / "HALT")
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    monkeypatch.setattr(fd, "github_app_token", lambda *a: "ghs_" + "x" * 36)
+    calls: list = []
+    monkeypatch.setattr(fd, "_dispatch_one", _dispatch_stub(calls))
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    rc = fd.main(
+        [
+            "--accounts", str(tmp_path / "a"),
+            "--execute",
+            "--app-id", "1",
+            "--app-installation-id", "2",
+            "--app-private-key", "/k.pem",
+        ]
+    )
+
+    assert rc == 0
+    assert len(calls) == 1
+
+
+def test_main_dry_run_needs_no_identity_optin(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(fd, "DISPATCH_LEDGER", tmp_path / "ledger.jsonl")
+    calls: list = []
+    monkeypatch.setattr(fd, "_dispatch_one", _dispatch_stub(calls))
+    _wire_single_candidate_orchestrator(monkeypatch)
+
+    rc = fd.main(["--accounts", str(tmp_path / "a")])
+
+    assert rc == 0
+    assert len(calls) == 1  # the dry-run _dispatch_one still reports
 
 
 def test_main_requires_all_three_app_flags_together(tmp_path: Path, monkeypatch) -> None:
