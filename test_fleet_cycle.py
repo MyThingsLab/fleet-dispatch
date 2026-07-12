@@ -9,6 +9,15 @@ import pytest
 import fleet_cycle as fc
 
 
+@pytest.fixture(autouse=True)
+def _no_halt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Keep every test hermetic: never read the real HALT marker and never
+    # shell out to `gh search issues` for the critical-issue gate. Tests that
+    # exercise the gate override these explicitly.
+    monkeypatch.setattr(fc, "HALT_MARKER", tmp_path / "HALT")
+    monkeypatch.setattr(fc, "_critical_halt_issues", lambda org: [])
+
+
 def test_select_brief_issues_skips_issues_with_pending_brief_pr() -> None:
     picked = fc._select_brief_issues(
         [4, 5, 6, 11],
@@ -120,6 +129,62 @@ def test_main_skips_mydashboard_when_docs_site_clone_missing(
     fc.main(["--accounts", "/tmp/acct", "--skip-dispatch", "--execute", "--brief-count", "0"])
     assert not any(cmd[0] == "mydashboard" for cmd, _ in calls)
     assert "skipping mydashboard" in capsys.readouterr().out
+
+
+def test_execute_cycle_refuses_when_halt_marker_present(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _capture_runs(monkeypatch)
+    marker = tmp_path / "HALT"
+    marker.write_text("halted\n")
+    monkeypatch.setattr(fc, "HALT_MARKER", marker)
+    fc.main(["--accounts", "/tmp/acct", "--execute", "--skip-dispatch", "--brief-count", "0"])
+    assert calls == []
+    assert "HALT marker present" in capsys.readouterr().out
+
+
+def test_dispatch_execute_alone_is_also_gated_by_halt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _capture_runs(monkeypatch)
+    marker = tmp_path / "HALT"
+    marker.write_text("halted\n")
+    monkeypatch.setattr(fc, "HALT_MARKER", marker)
+    fc.main(["--accounts", "/tmp/acct", "--dispatch-execute", "--brief-count", "0"])
+    assert calls == []
+    assert "cycle halted" in capsys.readouterr().out
+
+
+def test_execute_cycle_refuses_when_critical_issue_open(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = _capture_runs(monkeypatch)
+    monkeypatch.setattr(
+        fc,
+        "_critical_halt_issues",
+        lambda org: [
+            {
+                "repository": {"nameWithOwner": "MyThingsLab/my-guard"},
+                "number": 9,
+                "title": "broken invariant",
+                "url": "https://github.com/MyThingsLab/my-guard/issues/9",
+            }
+        ],
+    )
+    fc.main(["--accounts", "/tmp/acct", "--execute", "--skip-dispatch", "--brief-count", "0"])
+    assert calls == []
+    assert "my-guard#9" in capsys.readouterr().out
+
+
+def test_dry_run_is_not_gated_by_halt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _capture_runs(monkeypatch)
+    marker = tmp_path / "HALT"
+    marker.write_text("halted\n")
+    monkeypatch.setattr(fc, "HALT_MARKER", marker)
+    fc.main(["--accounts", "/tmp/acct", "--skip-dispatch", "--brief-count", "0"])
+    assert any(cmd[0] == "myplanner" for cmd, _ in calls)
 
 
 def test_gh_json_returns_none_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:

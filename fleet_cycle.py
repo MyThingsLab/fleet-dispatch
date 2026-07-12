@@ -55,7 +55,7 @@ from mythings.ledger import Ledger
 import account_usage
 import fleet_ask
 from cycle_driver import run_command
-from fleet_dispatch import DISPATCH_LEDGER
+from fleet_dispatch import DISPATCH_LEDGER, HALT_MARKER, _critical_halt_issues
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent
 ORG = "MyThingsLab"
@@ -131,7 +131,35 @@ def _brief_candidates(count: int) -> list[int] | None:
     )
 
 
+def _cycle_halt_reason() -> str | None:
+    # Mirror fleet_dispatch's two launch gates for the rest of the cycle. The
+    # dispatch step already refuses on its own, but steps 3-10 make billed
+    # Engine calls and mutate GitHub too, so a HALT marker / open critical
+    # issue must stop them just the same -- otherwise "kill switch armed"
+    # still spends money every iteration.
+    if HALT_MARKER.exists():
+        return (
+            f"HALT marker present at {HALT_MARKER} "
+            f"(clear with `python3 fleet_dispatch.py --clear-halt`)"
+        )
+    critical = _critical_halt_issues(ORG)
+    if critical:
+        refs = ", ".join(
+            f"{i['repository']['nameWithOwner']}#{i['number']}" for i in critical
+        )
+        return f"critical issue(s) open: {refs}"
+    return None
+
+
 def _run_cycle(args: argparse.Namespace, *, accounts: str, skip_dispatch: bool, py: str) -> None:
+    # Only a run that spends or mutates is gated; a pure dry run reports as
+    # usual (matching fleet_dispatch, whose dry run also proceeds with a note).
+    if args.execute or args.dispatch_execute:
+        reason = _cycle_halt_reason()
+        if reason is not None:
+            print(f"(cycle halted — {reason})")
+            return
+
     # 1. MyPlanner: refresh the recommended sequence.
     _run([
         "myplanner", "plan",
