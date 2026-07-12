@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from mythings import _secrets
 from mythings.github import github_app_token
 from mythings.isolation import Workspace
 from mythings.ledger import Ledger
@@ -141,6 +142,25 @@ DEFAULT_DENY_READS = [
 
 def _utc_ts() -> str:
     return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _redact_secrets(text: str) -> tuple[str, list[str]]:
+    # A worker transcript is persisted verbatim and its final_message lands in
+    # the ledger -- if a session ever echoes a credential (printenv, a leaked
+    # token in a fetched page), both records would hold it forever in a public
+    # repo's working tree. Redact anything credential-shaped before either is
+    # written. Redaction over rejection: the transcript's forensic value is
+    # the whole reason it exists, so keep the file and remove only the spans.
+    # scan_text detects; substitution reuses the same pattern table so the
+    # full match is removed, not scan_text's 40-char snippet prefix. A false
+    # positive (a test fixture that looks like a key) costs a few obscured
+    # characters in a forensic record -- the right side of that trade.
+    findings = _secrets.scan_text(text)
+    if not findings:
+        return text, []
+    for name, pattern in _secrets._PATTERNS.items():
+        text = pattern.sub(f"[REDACTED-{name}]", text)
+    return text, sorted({f.pattern for f in findings})
 
 
 def _today_spend_usd(ledger: Ledger, *, today: str | None = None) -> float:
@@ -861,10 +881,31 @@ def _dispatch_one(
                 args=["claude"], returncode=1, stdout=exc.stdout or "", stderr=exc.stderr or "",
             )
 
+        # Redact before anything derived from the session output is persisted:
+        # the transcript file, and (via parse_transcript below) the report's
+        # final_message / denial commands that _record_usage and the outcome
+        # entry write to the ledger.
+        clean_stdout, leaked = _redact_secrets(result.stdout)
+        if leaked:
+            print(
+                f"  [{account.name}] transcript contained credential-shaped text; "
+                f"redacted pattern(s): {', '.join(leaked)}"
+            )
+            ledger.record(
+                tool="fleet_dispatch",
+                kind="secret_alert",
+                outcome="redacted",
+                detail=f"{account.name} -> {candidate.id}: redacted credential-shaped "
+                f"text from the transcript before persisting it",
+                candidate=candidate.id,
+                account=account.name,
+                patterns=leaked,
+            )
+
         TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
         transcript_path = TRANSCRIPTS_DIR / f"{branch.replace('/', '_')}-{_utc_ts()}.jsonl"
-        transcript_path.write_text(result.stdout)
-        report = parse_transcript(result.stdout.splitlines())
+        transcript_path.write_text(clean_stdout)
+        report = parse_transcript(clean_stdout.splitlines())
         _record_usage(
             report, account=account, candidate=candidate, transcript_path=transcript_path,
             ledger=ledger, rtk=rtk,

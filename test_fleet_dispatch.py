@@ -992,6 +992,97 @@ def test_dispatch_one_passes_max_turns_and_max_budget_to_claude(tmp_path: Path, 
     assert argv[argv.index("--max-budget-usd") + 1] == "1.5"
 
 
+def test_redact_secrets_removes_full_token_and_names_pattern() -> None:
+    # Planted token built by concatenation so this source line never trips a
+    # diff-based secret scan itself.
+    token = "ghp_" + "a" * 40
+    clean, leaked = fd._redact_secrets(f"before {token} after")
+    assert token not in clean
+    assert "[REDACTED-github_token]" in clean
+    assert "before " in clean and " after" in clean
+    assert leaked == ["github_token"]
+
+
+def test_redact_secrets_clean_text_untouched() -> None:
+    text = "nothing secret here\njust output\n"
+    clean, leaked = fd._redact_secrets(text)
+    assert clean == text
+    assert leaked == []
+
+
+def test_dispatch_one_redacts_transcript_and_ledgers_alert(tmp_path: Path, monkeypatch) -> None:
+    candidate, account, ledger = _setup_dispatch_one_repo(tmp_path, monkeypatch)
+    token = "ghp_" + "b" * 40
+    stdout = (
+        json.dumps(
+            {
+                "type": "result",
+                "result": f"done, and here is a leak: {token}",
+                "total_cost_usd": 0.05,
+                "usage": {"output_tokens": 10},
+                "num_turns": 1,
+            }
+        )
+        + "\n"
+    )
+
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    fd._dispatch_one(
+        account,
+        candidate,
+        execute=True,
+        max_budget_usd=1.0,
+        max_turns=5,
+        ledger=ledger,
+        org="MyThingsLab",
+    )
+
+    (transcript,) = (tmp_path / "transcripts").iterdir()
+    persisted = transcript.read_text()
+    assert token not in persisted
+    assert "[REDACTED-github_token]" in persisted
+
+    entries = list(ledger.read(tool="fleet_dispatch"))
+    (alert,) = [e for e in entries if e.kind == "secret_alert"]
+    assert alert.outcome == "redacted"
+    assert alert.data["patterns"] == ["github_token"]
+    # The outcome entry's final_message must carry the redaction, not the token.
+    assert not any(token in e.data.get("final_message", "") for e in entries)
+
+
+def test_dispatch_one_clean_transcript_writes_no_alert(tmp_path: Path, monkeypatch) -> None:
+    candidate, account, ledger = _setup_dispatch_one_repo(tmp_path, monkeypatch)
+
+    real_run = fd.subprocess.run
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "claude":
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(fd.subprocess, "run", fake_run)
+
+    fd._dispatch_one(
+        account,
+        candidate,
+        execute=True,
+        max_budget_usd=1.0,
+        max_turns=5,
+        ledger=ledger,
+        org="MyThingsLab",
+    )
+
+    assert not any(e.kind == "secret_alert" for e in ledger.read(tool="fleet_dispatch"))
+
+
 def test_main_requires_all_three_app_flags_together(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("GH_TOKEN", raising=False)
 
