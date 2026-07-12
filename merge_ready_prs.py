@@ -21,6 +21,12 @@ import sys
 import time
 from dataclasses import dataclass
 
+from myguard import Guard
+from myguard.rules import MERGE_ACTION
+from mythings.policy import Action, Decision
+
+import fleet_ask
+
 ORG = "MyThingsLab"
 
 
@@ -143,11 +149,98 @@ def merge(pr: PR, *, retries: int = 4) -> None:
             raise
 
 
+def approve(pr: PR, guard: Guard) -> Decision:
+    # The merge goes through MyGuard as a structured `pr-merge` Action, which its
+    # `merge_needs_a_human` rule answers ASK. With an ask channel live that is a
+    # real Allow/Deny prompt on the operator's phone, and their tap *is* the merge.
+    # With no channel it collapses to DENY and nothing happens -- so this can never
+    # merge something a human did not approve.
+    action = Action(
+        kind=MERGE_ACTION,
+        payload={"repo": f"{ORG}/{pr.repo}", "number": pr.number, "title": pr.title},
+    )
+    return guard.evaluate(action).under(unattended=True)
+
+
+def merge_by_asking(ready: list[PR], guard: Guard, *, budget_s: float) -> int:
+    # Bounded on purpose. Each unanswered ask blocks for the full ask timeout, so a
+    # queue of PRs with nobody home would spend the whole pass timing out, one
+    # prompt at a time. The budget caps that: when it is gone, the rest go unasked
+    # rather than being silently denied by exhaustion.
+    deadline = time.monotonic() + budget_s
+    merged: list[str] = []
+    refused: list[str] = []
+    unasked: list[str] = []
+    failures: list[str] = []
+
+    for pr in ready:
+        name = f"{pr.repo}#{pr.number}"
+        if time.monotonic() >= deadline:
+            unasked.append(name)
+            continue
+
+        print(f"asking about {name} {pr.title!r}...")
+        if approve(pr, guard) is not Decision.ALLOW:
+            # Denied, or nobody answered. Both are a "no" -- fail-closed, as always.
+            print("  not approved — skipped")
+            refused.append(name)
+            continue
+        try:
+            merge(pr)
+        except RuntimeError as exc:
+            print(f"  approved, but the merge FAILED: {exc}", file=sys.stderr)
+            failures.append(name)
+            continue
+        print("  approved — merged")
+        merged.append(name)
+
+    print()
+    print(f"merged:   {', '.join(merged) or '—'}")
+    print(f"refused:  {', '.join(refused) or '—'}")
+    if unasked:
+        print(f"unasked:  {', '.join(unasked)}  (ask budget exhausted)")
+    if failures:
+        print(f"failed:   {', '.join(failures)}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--org", default=ORG)
-    parser.add_argument("--execute", action="store_true", help="actually merge; default is a dry run")
-    parser.add_argument("--repo", action="append", help="limit to this repo (repeatable); default: every org repo")
+    how = parser.add_mutually_exclusive_group()
+    how.add_argument(
+        "--execute",
+        action="store_true",
+        help="merge straight away; the human running this command *is* the human approving. Default is a dry run",
+    )
+    how.add_argument(
+        "--ask",
+        action="store_true",
+        help="merge only what the operator approves over Telegram: each PR becomes an Allow/Deny prompt via MyGuard's pr-merge ASK rule. Needs a running mytelegrambot daemon",
+    )
+    parser.add_argument(
+        "--ask-budget-min",
+        type=float,
+        default=15.0,
+        help="stop asking after this many minutes; the rest go unasked rather than timing out one by one (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ask-timeout",
+        type=int,
+        default=fleet_ask.DEFAULT_ASK_TIMEOUT,
+        help="seconds to wait for each Allow/Deny tap (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ask-remote-daemon",
+        action="store_true",
+        help="the daemon runs on another host sharing this ledger",
+    )
+    parser.add_argument(
+        "--repo",
+        action="append",
+        help="limit to this repo (repeatable); default: every org repo",
+    )
     args = parser.parse_args(argv)
 
     repos = args.repo or list_org_repos(args.org)
@@ -175,8 +268,22 @@ def main(argv: list[str] | None = None) -> int:
     for pr in ready:
         print(f"  {pr.repo}#{pr.number} {pr.title!r}")
 
+    if args.ask:
+        try:
+            wiring = fleet_ask.enable(
+                timeout=args.ask_timeout, remote_daemon=args.ask_remote_daemon
+            )
+        except fleet_ask.AskChannelUnavailable as exc:
+            print(f"\ncannot ask: {exc}", file=sys.stderr)
+            return 2
+        print(f"\nasking over Telegram -> {wiring['MYTHINGS_ASK_CMD']}\n")
+        # Built *after* the env is armed, so it picks the channel up.
+        return merge_by_asking(ready, Guard(), budget_s=args.ask_budget_min * 60)
+
     if not args.execute:
-        print("\n(dry run — pass --execute to actually merge these)")
+        print(
+            "\n(dry run — pass --execute to merge these here, or --ask to approve them from Telegram)"
+        )
         return 0
 
     print()
@@ -190,7 +297,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  FAILED: {exc}", file=sys.stderr)
             failures.append(f"{pr.repo}#{pr.number}")
     if failures:
-        print(f"\nfailed to merge: {', '.join(failures)} — re-run after checking them", file=sys.stderr)
+        print(
+            f"\nfailed to merge: {', '.join(failures)} — re-run after checking them",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
