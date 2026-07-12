@@ -307,6 +307,44 @@ def _next_backoff_s(current_backoff_s: float, *, dispatched: bool, idle_backoff_
     return min(current_backoff_s * 2.0, max_backoff_s)
 
 
+def _refresh_ask_channel(ledger: Ledger, *, timeout: int) -> None:
+    # The daemon-liveness preflight in fleet_ask.enable() runs once, when the
+    # channel is armed at startup. In --loop that isn't enough: a daemon that
+    # dies on day 2 turns every ASK into a full-timeout block followed by a
+    # DENY -- slower than no channel and just as closed, for the rest of the
+    # run, with nothing in the output to say why. Re-check the process table
+    # each iteration; disarm loudly when the daemon is gone (ASKs then deny
+    # fast, exactly the pre-channel behavior) and re-arm when it comes back.
+    armed = bool(os.environ.get("MYTHINGS_ASK_CMD"))
+    alive = fleet_ask.daemon_is_running()
+    if armed and not alive:
+        os.environ.pop("MYTHINGS_ASK_CMD", None)
+        os.environ.pop("MYTHINGS_ASK_TIMEOUT", None)
+        print(
+            "(ask daemon is gone — channel disarmed: ASKs now deny fast instead of "
+            "blocking the full timeout; restart `mytelegrambot run` to re-arm)"
+        )
+        ledger.record(
+            tool="fleet_cycle",
+            kind="ask_channel",
+            outcome="disarmed",
+            detail="mytelegrambot run daemon no longer running; ask channel disarmed",
+        )
+    elif not armed and alive:
+        try:
+            fleet_ask.enable(timeout=timeout)
+        except fleet_ask.AskChannelUnavailable as exc:
+            print(f"(ask daemon is back but the channel is still unavailable: {exc})")
+            return
+        print("(ask daemon is back — channel re-armed)")
+        ledger.record(
+            tool="fleet_cycle",
+            kind="ask_channel",
+            outcome="rearmed",
+            detail="mytelegrambot run daemon back; ask channel re-armed",
+        )
+
+
 def _run_loop(args: argparse.Namespace, py: str) -> int:
     pool = [a.strip() for a in args.accounts.split(",") if a.strip()]
     dispatch_ledger = Ledger(DISPATCH_LEDGER)
@@ -341,6 +379,12 @@ def _run_loop(args: argparse.Namespace, py: str) -> int:
             last_account_check = now
             if over:
                 print(f"(accounts over {args.max_session_pct}%: {[u.config_dir for u in over]})")
+
+        # A remote daemon shares only the ledger, not this process table, so
+        # its liveness can't be probed from here -- the startup preflight is
+        # skipped for it too (--ask-remote-daemon).
+        if args.ask_human and not args.ask_remote_daemon:
+            _refresh_ask_channel(dispatch_ledger, timeout=args.ask_timeout)
 
         iteration += 1
         print(f"\n=== loop iteration {iteration} ({elapsed_min:.1f} min elapsed, ${spent_usd:.2f} spent) ===")
