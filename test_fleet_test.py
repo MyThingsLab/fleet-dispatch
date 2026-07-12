@@ -49,7 +49,9 @@ def test_run_suites_argv_env_and_cwd(tmp_path: Path) -> None:
     assert cwd == root / "my-a"
     # No src/ dir in this fake repo, so no PYTHONPATH override.
     assert env.get("PYTHONPATH") == ft.os.environ.get("PYTHONPATH")
-    assert "GITHUB_ACTIONS" not in env or env["GITHUB_ACTIONS"] != "true"
+    # Pass-through, not an override: the attended path inherits the caller's
+    # env verbatim (including GITHUB_ACTIONS when fleet_test runs inside CI).
+    assert env.get("GITHUB_ACTIONS") == ft.os.environ.get("GITHUB_ACTIONS")
     assert results == [ft.RepoResult("my-a", True, results[0].duration)]
 
 
@@ -98,8 +100,10 @@ def test_summarize_reports_failures() -> None:
 def test_check_editable_core_accepts_the_serving_checkout() -> None:
     import mythings
 
-    root = Path(mythings.__file__).resolve().parents[3]
-    assert ft.check_editable_core(root) is None
+    resolved = Path(mythings.__file__).resolve().parent
+    if resolved.parts[-3:] != ("my-things-core", "src", "mythings"):
+        pytest.skip("mythings is not a workspace editable install here (e.g. CI site-packages)")
+    assert ft.check_editable_core(resolved.parents[2]) is None
 
 
 def test_check_editable_core_rejects_other_roots(tmp_path: Path) -> None:
