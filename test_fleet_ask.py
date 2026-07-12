@@ -32,7 +32,11 @@ def test_the_ask_command_points_at_the_ledger_the_daemon_actually_writes() -> No
     # The systemd unit sets WorkingDirectory to the bot's repo and `mytelegrambot
     # run` resolves .mythings/ledger.jsonl relative to it. If this drifts, the
     # rendezvous breaks and every ASK denies.
-    assert fleet_ask.BOT_LEDGER.parts[-3:] == ("my-telegram-bot", ".mythings", "ledger.jsonl")
+    assert fleet_ask.BOT_LEDGER.parts[-3:] == (
+        "my-telegram-bot",
+        ".mythings",
+        "ledger.jsonl",
+    )
 
 
 def test_guards_backstop_timeout_sits_above_asks_own_deadline() -> None:
@@ -56,7 +60,9 @@ def test_enable_refuses_when_no_daemon_is_running(
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: False)
     env: dict[str, str] = {}
 
-    with pytest.raises(fleet_ask.AskChannelUnavailable, match="no `mytelegrambot run` daemon"):
+    with pytest.raises(
+        fleet_ask.AskChannelUnavailable, match="no `mytelegrambot run` daemon"
+    ):
         fleet_ask.enable(ledger=ledger, env=env)
 
     assert env == {}  # nothing armed
@@ -68,7 +74,9 @@ def test_enable_refuses_when_the_ledger_directory_does_not_exist(
     monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
     env: dict[str, str] = {}
 
-    with pytest.raises(fleet_ask.AskChannelUnavailable, match="ledger directory does not exist"):
+    with pytest.raises(
+        fleet_ask.AskChannelUnavailable, match="ledger directory does not exist"
+    ):
         fleet_ask.enable(ledger=tmp_path / "nope" / "ledger.jsonl", env=env)
 
     assert env == {}
@@ -103,7 +111,9 @@ def test_enable_arms_the_env_every_subprocess_inherits(
 
     fleet_ask.enable(ledger=ledger, timeout=45, env=env)
 
-    assert env["MYTHINGS_ASK_CMD"].startswith("mytelegrambot ask --ledger ")
+    # Absolute, not a bare name: a subprocess may not inherit the venv on PATH.
+    assert " ask --ledger " in env["MYTHINGS_ASK_CMD"]
+    assert env["MYTHINGS_ASK_CMD"].startswith("/")
     assert "--timeout 45" in env["MYTHINGS_ASK_CMD"]
     assert env["MYTHINGS_ASK_TIMEOUT"] == "75"
 
@@ -154,3 +164,31 @@ def test_the_daemon_check_finds_the_real_console_script_form(tmp_path: Path) -> 
     finally:
         proc.terminate()
         proc.wait()
+
+
+def test_the_ask_command_names_the_binary_absolutely_not_by_bare_name() -> None:
+    # The bug this pins, found on the Pi against the real daemon: `mytelegrambot` is
+    # a venv console script, and a subprocess does not necessarily inherit a PATH
+    # containing that venv's bin. A bare name raised FileNotFoundError, MyGuard read
+    # that as a DENY, and every merge was silently refused by a channel that had
+    # never reached anyone -- fail-closed, but for the wrong reason, with no human
+    # ever asked.
+    command = fleet_ask.ask_command()
+
+    assert command.startswith("/"), command  # absolute, resolved from sys.executable
+    assert Path(command.split()[0]).name == "mytelegrambot"
+
+
+def test_enable_refuses_when_the_ask_binary_cannot_be_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ledger = tmp_path / ".mythings" / "ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    monkeypatch.setattr(fleet_ask, "daemon_is_running", lambda: True)
+    monkeypatch.setattr(fleet_ask, "ask_binary", lambda: None)
+    env: dict[str, str] = {}
+
+    with pytest.raises(fleet_ask.AskChannelUnavailable, match="not runnable"):
+        fleet_ask.enable(ledger=ledger, env=env)
+
+    assert env == {}  # nothing armed
