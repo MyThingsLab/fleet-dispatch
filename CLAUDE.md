@@ -45,8 +45,24 @@ Canonical homes: the harness lives at `my-things-core/src/mythings/harness.md`
 - **Branch before commit.** Never commit on a local `main`; check out a branch
   immediately after syncing `main`. Every change lands via PR — `main` is
   branch-protected (PR + green `test` check required) in every shipped repo.
-- **Never merge a PR yourself.** Open it, get CI green, mark it ready; a human
-  always merges.
+- **Merging is gated, not forbidden.** Autonomous merge is the point of CAD; an
+  *unverified* merge is what the old "never merge" rule was actually guarding
+  against. A session or worker may merge a PR when all of the following hold,
+  each established by mechanism rather than by the merging agent's own judgement:
+  its required checks report `pass` — not `skipped`, not `none`, see
+  `myfleet.fleet_dispatch._checks_state`; it is not a draft; the repo's `main` is
+  branch-protected, so "required" means something; and its diff stays inside the
+  scope of the issue it closes. Short of all four, it stays open for a human.
+  Note what this does *not* accept as evidence: a green check the branch
+  protection does not require, a suite that passed without `pythonpath = ["src"]`
+  (it tested the editable install, not the diff), or the merging agent's
+  confidence in a diff it wrote.
+- **Four kinds of change need a human however green they are.** The merge gate's
+  own code and any `myfleet` merge path — a gate must never certify itself.
+  The constraints on agents: this file, `HARNESS.md`, CI workflows, branch
+  protection, `.claude/settings*.json`. Credential and auth handling. Public API
+  and schema migrations. These are the changes where merging a bad one destroys
+  the ability to catch the next one, so they do not get to ride the gate.
 - **Never persist secrets.** No tokens on disk, in git, or in the ledger; use
   `gh secret set`. Treat any secret pasted into chat as exposed.
 - **Re-check live state before acting.** An external multi-worker dispatcher
