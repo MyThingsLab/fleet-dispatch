@@ -49,13 +49,14 @@ The script is preserved at `scripts-fanout-pythonpath.py` in this worktree.
 .venv/bin/python scripts-fanout-pythonpath.py /tmp/fanout <comma,separated,repos>
 ```
 
-**Done (prepared, unpushed):** my-archivist, my-bibliography, my-glossary,
-my-cartographer, my-changelogger, my-dashboard, my-data-analysist, my-embedder,
-my-equations, my-flashcards, my-grader, my-idea, my-pipeline, my-planner,
-my-professor
+**Pushed — 15 PRs open, all CI green, each with an issue and a `Closes #N`:**
+my-archivist#12, my-bibliography#7, my-cartographer#4, my-changelogger#15,
+my-dashboard#9, my-data-analysist#5, my-embedder#5, my-equations#7,
+my-flashcards#6, my-glossary#10, my-grader#6, my-idea#73, my-pipeline#9,
+my-planner#14, my-professor#6. Nothing is stranded on the old machine.
 
-**Not started:** my-projector, my-researcher, my-searcher, my-server, my-site,
-my-syllabus, my-tables, my-telegram-bot, my-todo
+**Not started — 9 repos:** my-projector, my-researcher, my-searcher, my-server,
+my-site, my-syllabus, my-tables, my-telegram-bot, my-todo
 
 The script only *prepares* — it clones, edits, verifies, and stops. Committing,
 pushing, opening the PR and filing the issue are still manual. Each PR needs a
@@ -122,11 +123,31 @@ exists:
 CLAUDE_CONFIG_DIR=~/.claude-work claude -p "reply with exactly: ALIVE"
 ```
 
+## Branch protection
+
+Applied to `my-cartographer` and `my-embedder` on 2026-09-12: both had **no
+protection at all**, found because `gh pr checks --required` returned nothing on
+their fan-out PRs. An earlier org-wide audit had reported everything protected
+and was simply wrong — re-audit rather than trusting it:
+
+```
+for r in $(gh repo list MyThingsLab --limit 200 --no-archived --json name -q '.[].name'); do
+  gh api repos/MyThingsLab/$r/branches/main/protection --silent >/dev/null 2>&1 || echo "UNPROTECTED $r"
+done
+```
+
+Still unprotected, deliberately not touched — none are Python tool repos and
+none have a `test` check to require: `.github`, `study`, `typst-personal-docs`,
+`typst-templates`. Decide separately whether they should be.
+
+This matters to the gate: `main_protected` is a check, and a repo with no
+protection can never be ACCEPTED, because nothing is required and so no green
+check is evidence.
+
 ## Next steps, in order
 
 1. Merge `my-fleet#42`, then `my-coder#30`
-2. Finish the product fan-out (15 prepared, 9 untouched) — file an issue per
-   repo, `Closes #N` in each PR, then merge through the gate
+2. Merge the 15 fan-out PRs through the gate, then do the remaining 9 repos
 3. Build the `my-fleet#31` auth preflight — an expired session must not be able
    to present as an idle fleet
 4. `my-coder#28` — fold session stderr into the outcome detail; `claude exited 1`
