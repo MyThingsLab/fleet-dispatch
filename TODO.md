@@ -1,29 +1,142 @@
 # TODO — MyThingsLab
 
-_Curated by **my-todo** from open issues._ `fleet-dispatch#N` issue refs below
-live in this root repo (still named `fleet-dispatch` on GitHub) even though
-its scripts moved to [my-fleet](https://github.com/MyThingsLab/my-fleet).
+_Curated by **my-todo** from open issues._
 
 ## Now
-- [ ] fleet-dispatch#6 safety: add dependency-vulnerability scanning across the fleet `safety`
-- [ ] fleet-dispatch#7 safety: introduce a permission-scoped GitHub App identity (replace personal PAT) `safety` `needs-decision`
-- [ ] fleet-dispatch#8 safety: enforce a hard spend/turn cap before headless sessions `safety`
 - [ ] fleet-dispatch#9 safety: add a secret-leak check on ledger/PR content `safety`
-- [ ] fleet-dispatch#10 safety: document + implement an explicit fleet kill switch `safety`
+- [ ] fleet-dispatch#30 safety: enforce separation between the two dispatcher identities (personal vs mythingslab) `safety`
+- [ ] fleet-dispatch#41 Spend tripwire: push when cost crosses a threshold, with Halt / Raise cap `enhancement` `safety`
+- [ ] fleet-dispatch#44 A stuck worker should ask a human, not just give up `enhancement` `safety`
+- [ ] fleet-dispatch#46 EPIC: put the human back in the loop — supervise, plan and direct the fleet from Telegram `enhancement` `safety`
+- [ ] fleet-dispatch#59 Default dispatch to the GitHub App identity `safety` `needs-decision`
+- [ ] fleet-dispatch#60 fleet_cycle must honour HALT and critical-issue halt for all billed steps `bug` `safety`
+- [ ] fleet-dispatch#61 handoff.sh: discover repos via glob; drop the stale mythings-core name `bug` `documentation`
+- [ ] fleet-dispatch#62 --loop: re-preflight the ASK daemon each iteration; degrade loudly `enhancement` `safety`
+- [ ] fleet-dispatch#63 Fetch origin before basing worker worktrees; fetch sweep at cycle start `bug`
+- [ ] fleet-dispatch#64 Secret-scan worker transcripts and ledger record content `safety`
+- [ ] my-things-core#105 Engine context contract: transmit or rename; contract-test the boundary; fix my-guide.wish() `bug` `core-contract` `needs-decision`
 
 ## Next
 - [ ] fleet-dispatch#12 tool-build: build MyReviewer (flag correctness bugs on a PR) `tool-build` `needs-decision`
 - [ ] fleet-dispatch#14 tool-build: re-scope + build MyCoder (issue → diff → PR) `tool-build` `needs-decision`
-- [ ] my-things-core#35 core: add GitHub.diff(number) — PR unified-diff accessor `enhancement` `core-contract` `needs-decision`
-- [ ] my-things-core#36 core: decide the shared 'shortlist-from-a-corpus-then-cite' seam `core-contract` `needs-decision`
+- [ ] fleet-dispatch#25 template: my-service-template + retrofit my-server / my-telegram-bot / my-dashboard `tool-build` `needs-decision`
+- [ ] fleet-dispatch#42 Merge from chat: /prs with an Approve & merge button (the throughput bottleneck) `enhancement` `needs-decision`
+- [ ] fleet-dispatch#43 /plan: approve, reorder or skip the recommended sequence before it runs `enhancement` `needs-decision`
 - [ ] my-things-core#38 core: an ASK channel so unattended tools ask instead of failing closed `enhancement` `core-contract` `needs-decision`
+- [ ] my-things-core#55 core: promote mythings.selection.ordered_selection — the ≥3-caller threshold is met `enhancement` `core-contract`
+- [ ] my-things-core#57 core: declare the service archetype — split harness.md into tool + service harnesses `core-contract` `needs-decision`
+- [ ] my-things-core#72 safety: land core#70 (mythings._compat coherence gate) — all 5 declared capabilities currently unmet `core-contract`
+- [ ] my-things-core#90 core: weight mythings.corpus shortlist() by IDF `core-contract`
+- [ ] my-things-core#96 core: mythings.corpus silently ingests image-only (scanned) PDFs as near-empty documents `core-contract`
+- [ ] my-things-core#106 Shared build_engine factory: CachingEngine + kind=engine_usage ledger metering `enhancement` `core-contract`
 
 ## Later
 - [ ] fleet-dispatch#1 Fleet next milestone: unbuilt tools, docs hygiene, safety gaps
-- [ ] fleet-dispatch#11 tool-build: build MySearcher (rank files relevant to an issue) `tool-build`
 - [ ] fleet-dispatch#13 tool-build: build MyGroomer (split + label raw issues) `tool-build`
 - [ ] fleet-dispatch#15 tool-build: build MyWiki (Q&A over this repo's ledger history) `tool-build`
 - [ ] fleet-dispatch#16 tool-build: build MyDriftWatcher (flag cross-repo convention drift) `tool-build`
 - [ ] fleet-dispatch#17 tool-build: umbrella — remaining designed tools (Grapher/Knowledger/Scaffolder/Advisor/Describer) `tool-build`
+- [ ] fleet-dispatch#26 A tool that let me chat with my documents. For example: I'm reading a difficult part in a physics research and I don't understand something. The idea is to modify the content in order for me to understand it. `my-idea`
+- [ ] fleet-dispatch#40 Verify MyPlanner and MyProjector stop failing closed once the ask channel is live `enhancement`
+- [ ] fleet-dispatch#65 systemd timer for the bookkeeping half-cycle (no dispatch) `enhancement`
+- [ ] my-designer#2 Ecosystem home page — hero, tool showcase, dashboard link `my-designer`
+- [ ] my-designer#4 Tools index page — grouped by build status `my-designer`
+- [ ] my-guard#12 Guard's default is ALLOW, so an action kind nobody wrote a rule for is an action nobody is guarding `enhancement`
+- [ ] my-idea#2 verdict=build should auto-draft a design-doc stub + tracking issue `enhancement`
+- [ ] my-idea#3 harvest: a scheduled overlap re-check across open idea issues + the design-doc corpus `enhancement`
+- [ ] my-idea#4 my-data-analysist `my-idea`
+- [ ] my-idea#5 my-checkpointer `my-idea`
+- [ ] my-idea#6 my-manim-editor `my-idea`
+- [ ] my-idea#7 my-signal-processor `my-idea`
+- [ ] my-idea#9 my-notes `my-idea`
+- [ ] my-idea#10 my-image-processor `my-idea`
+- [ ] my-idea#11 my-finder `my-idea`
+- [ ] my-idea#12 my-audio-editor `my-idea`
+- [ ] my-idea#14 my-video-editor `my-idea`
+- [ ] my-idea#15 my-lyrics A tool to find songs lyrics `my-idea`
+- [ ] my-idea#16 my-toc "A table of content tool" `my-idea`
+- [ ] my-idea#17 my-fact-checker `my-idea`
+- [ ] my-idea#18 my-bug-reporter `my-idea`
+- [ ] my-idea#19 my-crossword `my-idea`
+- [ ] my-idea#20 my-cli-designer `my-idea`
+- [ ] my-idea#21 my-command-designer `my-idea`
+- [ ] my-idea#22 my-taxes `my-idea`
+- [ ] my-idea#23 my-finances `my-idea`
+- [ ] my-idea#24 my-lawyer `my-idea`
+- [ ] my-idea#25 my-trader `my-idea`
+- [ ] my-idea#26 my-music `my-idea`
+- [ ] my-idea#27 my-maps `my-idea`
+- [ ] my-idea#28 my-trip-planner `my-idea`
+- [ ] my-idea#29 my-city-explorer `my-idea`
+- [ ] my-idea#30 my-tickets `my-idea`
+- [ ] my-idea#31 my-house-finder `my-idea`
+- [ ] my-idea#32 my-job-finder `my-idea`
+- [ ] my-idea#33 my-party-finder `my-idea`
+- [ ] my-idea#34 my-music-finder `my-idea`
+- [ ] my-idea#35 my-film-finder `my-idea`
+- [ ] my-idea#36 my-unicorn-finder `my-idea`
+- [ ] my-idea#37 my-fridge `my-idea`
+- [ ] my-idea#38 my-recipies `my-idea`
+- [ ] my-idea#39 my-shopping-list `my-idea`
+- [ ] my-idea#40 my-chef `my-idea`
+- [ ] my-idea#41 my-memories `my-idea`
+- [ ] my-idea#42 my-sidequest `my-idea`
+- [ ] my-idea#43 my-sudoku `my-idea`
+- [ ] my-idea#44 my-game-dev `my-idea`
+- [ ] my-idea#45 my-app-dev `my-idea`
+- [ ] my-idea#46 my-renderer `my-idea`
+- [ ] my-idea#47 my-site-anim `my-idea`
+- [ ] my-idea#48 my-site-designer `my-idea`
+- [ ] my-idea#49 my-product-designer `my-idea`
+- [ ] my-idea#50 my-avatar `my-idea`
+- [ ] my-idea#51 my-addresses `my-idea`
+- [ ] my-idea#52 my-gardener `my-idea`
+- [ ] my-idea#53 my-checklist `my-idea`
+- [ ] my-idea#54 my-secretary `my-idea`
+- [ ] my-idea#55 my-briefer `my-idea`
+- [ ] my-idea#56 my-web-search `my-idea`
+- [ ] my-idea#57 my-goals `my-idea`
+- [ ] my-idea#58 my-friends `my-idea`
+- [ ] my-idea#59 my-reminder `my-idea`
+- [ ] my-idea#60 my-hobby `my-idea`
+- [ ] my-idea#61 my-morning-routine `my-idea`
+- [ ] my-idea#62 my-sleep `my-idea`
+- [ ] my-idea#63 my-mood `my-idea`
+- [ ] my-idea#65 my-gps `my-idea`
+- [ ] my-orchestrator#17 Rank unwritten-but-demanded design docs as candidates `enhancement`
+- [ ] my-projector#7 Consume the canonical fleet registry (tools_manifest.json) from core `enhancement`
+- [ ] my-raytracer#2 Vec3 + Ray core types
+- [ ] my-raytracer#3 Pinhole camera: generate primary rays
+- [ ] my-raytracer#4 Sphere/Plane geometry + Material, ray intersection
+- [ ] my-raytracer#5 Scene container: objects + point lights, nearest-hit query
+- [ ] my-raytracer#6 Monte Carlo path tracer core: cosine-weighted Lambertian integration
+- [ ] my-raytracer#7 Full-image render loop + PPM writer
+- [ ] my-raytracer#8 Scene JSON schema + CLI entry point
+- [ ] my-telegram-bot#19 Telegram Mini App (richer idea compose surface) — needs webhook + HTTPS `enhancement` `my-telegram-bot`
+- [ ] my-telegram-bot#27 notify pushes raw ledger lines; make it a cycle summary a human can act on `enhancement` `my-telegram-bot`
+- [ ] my-telegram-bot#28 Thread notifications by subject — one flat chat will not survive 30 repos `enhancement` `my-telegram-bot`
+- [ ] my-telegram-bot#29 Make notifications interrogable: a Why? button on digest items `enhancement` `my-telegram-bot`
 - [ ] my-things-core#37 docs: reconcile mythings-template.md vs the shipped my-template repo `documentation`
-- [ ] my-uni#2 tool-build: implement MyUni v0 (field → curriculum topic issues) `tool-build`
+- [ ] my-things-core#58 docs: generate the docs/tools README table from tools_manifest.json `documentation`
+- [ ] study#1 Physics `my-uni`
+- [ ] study#2 AI & Machine Learning `my-uni`
+- [ ] study#6 Classical Mechanics II (Lagrangian & Hamiltonian) `my-uni` `my-researcher`
+- [ ] study#7 Electromagnetism I (Electrostatics & Magnetostatics) `my-uni` `my-researcher`
+- [ ] study#8 Electromagnetism II (Maxwell's Equations & Electrodynamics) `my-uni` `my-researcher`
+- [ ] study#9 Waves and Optics `my-uni` `my-researcher`
+- [ ] study#10 Thermodynamics `my-uni` `my-researcher`
+- [ ] study#12 Special Relativity `my-uni` `my-researcher`
+- [ ] study#13 Quantum Mechanics I (Introductory) `my-uni` `my-researcher`
+- [ ] study#14 Quantum Mechanics II (Advanced) `my-uni` `my-researcher`
+- [ ] study#15 Atomic and Molecular Physics `my-uni` `my-researcher`
+- [ ] study#16 Linear Algebra `my-uni` `my-researcher`
+- [ ] study#17 Calculus & Optimization Basics `my-uni` `my-researcher`
+- [ ] study#18 Probability & Statistics `my-uni` `my-researcher`
+- [ ] study#19 Programming for ML (Python/NumPy) `my-uni` `my-researcher`
+- [ ] study#20 Data Preprocessing & Feature Engineering `my-uni` `my-researcher`
+- [ ] study#21 Supervised Learning Fundamentals `my-uni` `my-researcher`
+- [ ] study#22 Model Evaluation & Validation `my-uni` `my-researcher`
+- [ ] study#23 Classical ML Algorithms `my-uni` `my-researcher`
+- [ ] study#24 Ensemble Methods `my-uni` `my-researcher`
+- [ ] study#25 Unsupervised Learning `my-uni` `my-researcher`
+- [ ] study#26 Optimization for ML `my-uni` `my-researcher`
